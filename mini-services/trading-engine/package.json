@@ -1,0 +1,11 @@
+{
+  "name": "trading-engine",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "bun --hot index.ts"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "socket.io": "^4.8.1"
+  }
+}

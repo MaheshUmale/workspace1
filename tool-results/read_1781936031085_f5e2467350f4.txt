@@ -1,0 +1,502 @@
+    35→    35→    35→    35→
+    36→    36→    36→    36→
+    37→    37→    37→    37→class MarketEngine:
+    38→    38→    38→    38→    """Core market engine that orchestrates simulator and live data, pushes events."""
+    39→    39→    39→    39→
+    40→    40→    40→    40→    def __init__(self):
+    41→    41→    41→    41→        self.simulator = DataSimulator()
+    42→    42→    42→    42→        self.upstox: Optional[UpstoxClient] = None
+    43→    43→    43→    43→        self.mode = "simulation"
+    44→    44→    44→    44→        self.is_connected = False
+    45→    45→    45→    45→        self.tick_count = 0
+    46→    46→    46→    46→        self.start_time = time.time()
+    47→    47→    47→    47→        self._db = get_db()
+    48→    48→    48→    48→        self._update_task: Optional[asyncio.Task] = None
+    49→    49→    49→    49→        # Cache live option chain data per symbol for 7-strike calculations
+    50→    50→    50→    50→        self._live_chain_cache: Dict[str, dict] = {}
+    51→    51→    51→    51→
+    52→    52→    52→    52→    # ================================================================
+    53→    53→    53→    53→    # Initialization & Shutdown
+    54→    54→    54→    54→    # ================================================================
+    55→    55→    55→    55→
+    56→    56→    56→    56→    async def initialize(self):
+    57→    57→    57→    57→        """Initialize engine — validate Upstox token if available."""
+    58→    58→    58→    58→        if UPSTOX_ACCESS_TOKEN:
+    59→    59→    59→    59→            self.upstox = UpstoxClient(UPSTOX_ACCESS_TOKEN)
+    60→    60→    60→    60→            result = await self.upstox.validate_token()
+    61→    61→    61→    61→            if result.get("valid"):
+    62→    62→    62→    62→                self.mode = "live"
+    63→    63→    63→    63→                self.is_connected = True
+    64→    64→    64→    64→                print(f"[MarketEngine] Upstox connected. Mode: LIVE — Real data only")
+    65→    65→    65→    65→            else:
+    66→    66→    66→    66→                print(f"[MarketEngine] Upstox token invalid: {result.get('error')}. Mode: SIMULATION")
+    67→    67→    67→    67→        else:
+    68→    68→    68→    68→            print("[MarketEngine] No Upstox token. Mode: SIMULATION")
+    69→    69→    69→    69→
+    70→    70→    70→    70→        # Pre-populate database with simulator history (provides baseline data)
+    71→    71→    71→    71→        self._store_simulator_history()
+    72→    72→    72→    72→
+    73→    73→    73→    73→        # Start periodic update task
+    74→    74→    74→    74→        self._update_task = asyncio.create_task(self._periodic_update())
+    75→    75→    75→    75→
+    76→    76→    76→    76→    def shutdown(self):
+    77→    77→    77→    77→        """Gracefully shut down the engine and all resources."""
+    78→    78→    78→    78→        if self._update_task:
+    79→    79→    79→    79→            self._update_task.cancel()
+    80→    80→    80→    80→        if self.upstox:
+    81→    81→    81→    81→            asyncio.create_task(self.upstox.close())
+    82→    82→    82→    82→        self._db.close()
+    83→    83→    83→    83→        print("[MarketEngine] Shutdown complete.")
+    84→    84→    84→    84→
+    85→    85→    85→    85→    # ================================================================
+    86→    86→    86→    86→    # Database Pre-population
+    87→    87→    87→    87→    # ================================================================
+    88→    88→    88→    88→
+    89→    89→    89→    89→    def _store_simulator_history(self):
+    90→    90→    90→    90→        """Store simulator's pre-generated historical data into DuckDB."""
+    91→    91→    91→    91→        for symbol in ["NIFTY", "BANKNIFTY"]:
+    92→    92→    92→    92→            history = self.simulator.get_7strike_history(symbol, "")
+    93→    93→    93→    93→            for point in history.get("coi_pcr_series", []):
+    94→    94→    94→    94→                self._db.store_coi_pcr_point(symbol, point)
+    95→    95→    95→    95→            for point in history.get("volume_proxy_series", []):
+    96→    96→    96→    96→                self._db.store_volume_proxy(symbol, point)
+    97→    97→    97→    97→            for trade in history.get("trade_suggestions", []):
+    98→    98→    98→    98→                trade_with_symbol = {**trade, "symbol": symbol}
+    99→    99→    99→    99→                self._db.store_trade_suggestion(trade_with_symbol)
+   100→   100→   100→   100→            for cluster in history.get("trap_clusters", []):
+   101→   101→   101→   101→                cluster_with_symbol = {**cluster, "symbol": symbol}
+   102→   102→   102→   102→                self._db.store_trap_cluster(cluster_with_symbol)
+   103→   103→   103→   103→            for signal in history.get("signals", []):
+   104→   104→   104→   104→                self._db.store_signal(symbol, signal)
+   105→   105→   105→   105→            pcr_data = self.simulator.get_pcr(symbol, "")
+   106→   106→   106→   106→            for point in pcr_data.get("data", []):
+   107→   107→   107→   107→                self._db.store_pcr_point(symbol, point)
+   108→   108→   108→   108→            from config import TIMEFRAME_MAP
+   109→   109→   109→   109→            for tf in TIMEFRAME_MAP:
+   110→   110→   110→   110→                candles = self.simulator.get_candles(symbol, tf)
+   111→   111→   111→   111→                if candles:
+   112→   112→   112→   112→                    self._db.store_candles(symbol, tf, candles)
+   113→   113→   113→   113→
+   114→   114→   114→   114→        print(f"[MarketEngine] Pre-populated DB with simulator history")
+   115→   115→   115→   115→
+   116→   116→   116→   116→    # ================================================================
+   117→   117→   117→   117→    # Periodic Update Loop
+   118→   118→   118→   118→    # ================================================================
+   119→   119→   119→   119→
+   120→   120→   120→   120→    async def _periodic_update(self):
+   121→   121→   121→   121→        """Periodic update loop — fetches live data or advances simulator."""
+   122→   122→   122→   122→        while True:
+   123→   123→   123→   123→            try:
+   124→   124→   124→   124→                await asyncio.sleep(3)
+   125→   125→   125→   125→                self.tick_count += 1
+   126→   126→   126→   126→
+   127→   127→   127→   127→                if self.mode == "live" and self.upstox:
+   128→   128→   128→   128→                    await self._update_live_data()
+   129→   129→   129→   129→                else:
+   130→   130→   130→   130→                    self.simulator.update()
+   131→   131→   131→   131→                    for symbol in ["NIFTY", "BANKNIFTY"]:
+   132→   132→   132→   132→                        self._update_symbol_to_db_from_sim(symbol)
+   133→   133→   133→   133→
+   134→   134→   134→   134→            except asyncio.CancelledError:
+   135→   135→   135→   135→                break
+   136→   136→   136→   136→            except Exception as e:
+   137→   137→   137→   137→                print(f"[MarketEngine] Update error: {e}")
+   138→   138→   138→   138→                await asyncio.sleep(5)
+   139→   139→   139→   139→
+   140→   140→   140→   140→    async def _update_live_data(self):
+   141→   141→   141→   141→        """Fetch live data from Upstox and process it."""
+   142→   142→   142→   142→        for symbol in ["NIFTY", "BANKNIFTY"]:
+   143→   143→   143→   143→            try:
+   144→   144→   144→   144→                # Get the latest expiry for this symbol
+   145→   145→   145→   145→                config = UNDERLYING_CONFIG.get(symbol, {})
+   146→   146→   146→   146→                step = config.get("strike_step", 50)
+   147→   147→   147→   147→
+   148→   148→   148→   148→                # Fetch live option chain
+   149→   149→   149→   149→                result = await self.upstox.get_option_chain(symbol, "")
+   150→   150→   150→   150→                if not result.get("success") or not result.get("data"):
+   151→   151→   151→   151→                    continue
+   152→   152→   152→   152→
+   153→   153→   153→   153→                upstox_data = result["data"]
+   154→   154→   154→   154→                spot_price = result.get("spot_price", 0)
+   155→   155→   155→   155→                if not spot_price and upstox_data:
+   156→   156→   156→   156→                    spot_price = _norm(upstox_data[0].get("underlying_spot_price"), 0)
+   157→   157→   157→   157→                if not spot_price:
+   158→   158→   158→   158→                    continue
+   159→   159→   159→   159→
+   160→   160→   160→   160→                atm = round(spot_price / step) * step
+   161→   161→   161→   161→
+   162→   162→   162→   162→                # Transform to our internal format and cache
+   163→   163→   163→   163→                chain = self._transform_upstox_chain(upstox_data, symbol, step)
+   164→   164→   164→   164→                self._live_chain_cache[symbol] = {
+   165→   165→   165→   165→                    "spot_price": spot_price,
+   166→   166→   166→   166→                    "atm_strike": atm,
+   167→   167→   167→   167→                    "strike_step": step,
+   168→   168→   168→   168→                    "chain": chain,
+   169→   169→   169→   169→                    "timestamp": int(time.time() * 1000),
+   170→   170→   170→   170→                }
+   171→   171→   171→   171→
+   172→   172→   172→   172→                # Compute 7-strike matrix from live data
+   173→   173→   173→   173→                matrix = self._compute_7strike_matrix_live(symbol, "", spot_price, atm, step, chain)
+   174→   174→   174→   174→                if matrix:
+   175→   175→   175→   175→                    self._db.store_coi_pcr_point(symbol, {
+   176→   176→   176→   176→                        "timestamp": int(time.time() * 1000),
+   177→   177→   177→   177→                        "coi_pcr": matrix["coi_pcr"],
+   178→   178→   178→   178→                        "spot": matrix["spot_price"],
+   179→   179→   179→   179→                        "ce_coi_sum": matrix["ce_coi_sum"],
+   180→   180→   180→   180→                        "pe_coi_sum": matrix["pe_coi_sum"],
+   181→   181→   181→   181→                        "state": matrix["state"],
+   182→   182→   182→   182→                        "signal_type": "NEUTRAL",
+   183→   183→   183→   183→                        "confidence": 0,
+   184→   184→   184→   184→                    })
+   185→   185→   185→   185→
+   186→   186→   186→   186→                    # Compute signals
+   187→   187→   187→   187→                    signals = self._compute_signals_live(symbol, "", matrix)
+   188→   188→   188→   188→                    if signals and signals.get("current_signal"):
+   189→   189→   189→   189→                        cs = signals["current_signal"]
+   190→   190→   190→   190→                        self._db.store_signal(symbol, cs)
+   191→   191→   191→   191→
+   192→   192→   192→   192→                        # Update the last COI PCR point with signal info
+   193→   193→   193→   193→                        self._db.store_coi_pcr_point(symbol, {
+   194→   194→   194→   194→                            "timestamp": int(time.time() * 1000),
+   195→   195→   195→   195→                            "coi_pcr": matrix["coi_pcr"],
+   196→   196→   196→   196→                            "spot": matrix["spot_price"],
+   197→   197→   197→   197→                            "ce_coi_sum": matrix["ce_coi_sum"],
+   198→   198→   198→   198→                            "pe_coi_sum": matrix["pe_coi_sum"],
+   199→   199→   199→   199→                            "state": matrix["state"],
+   200→   200→   200→   200→                            "signal_type": cs["signal_type"],
+   201→   201→   201→   201→                            "confidence": cs["confidence"],
+   202→   202→   202→   202→                        })
+   203→   203→   203→   203→
+   204→   204→   204→   204→                # Store option chain snapshot for replay
+   205→   205→   205→   205→                self._db.store_option_chain_snapshot(
+   206→   206→   206→   206→                    symbol, "", spot_price, atm,
+   207→   207→   207→   207→                    json.dumps([{
+   208→   208→   208→   208→                        "strike": r["strike"],
+   209→   209→   209→   209→                        "ce_oi": r["ce"]["oi"], "ce_change_oi": r["ce"]["change_oi"],
+   210→   210→   210→   210→                        "pe_oi": r["pe"]["oi"], "pe_change_oi": r["pe"]["change_oi"],
+   211→   211→   211→   211→                        "ce_ltp": r["ce"]["ltp"], "pe_ltp": r["pe"]["ltp"],
+   212→   212→   212→   212→                    } for r in chain])
+   213→   213→   213→   213→                )
+   214→   214→   214→   214→
+   215→   215→   215→   215→                # Compute and store PCR
+   216→   216→   216→   216→                total_ce_oi = sum(r["ce"]["oi"] for r in chain)
+   217→   217→   217→   217→                total_pe_oi = sum(r["pe"]["oi"] for r in chain)
+   218→   218→   218→   218→                pcr_val = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 1.0
+   219→   219→   219→   219→                self._db.store_pcr_point(symbol, {
+   220→   220→   220→   220→                    "timestamp": int(time.time() * 1000),
+   221→   221→   221→   221→                    "spot": spot_price,
+   222→   222→   222→   222→                    "pcr": round(pcr_val, 4),
+   223→   223→   223→   223→                    "change_pcr": 0,
+   224→   224→   224→   224→                })
+   225→   225→   225→   225→
+   226→   226→   226→   226→            except Exception as e:
+   227→   227→   227→   227→                print(f"[MarketEngine] Live update error for {symbol}: {e}")
+   228→   228→   228→   228→
+   229→   229→   229→   229→    def _update_symbol_to_db_from_sim(self, symbol: str):
+   230→   230→   230→   230→        """Update DB with simulator data for a single symbol."""
+   231→   231→   231→   231→        now_ms = int(time.time() * 1000)
+   232→   232→   232→   232→        matrix = self.simulator.get_7strike_matrix(symbol, "")
+   233→   233→   233→   233→        if matrix:
+   234→   234→   234→   234→            point = {
+   235→   235→   235→   235→                "timestamp": now_ms,
+   236→   236→   236→   236→                "coi_pcr": matrix["coi_pcr"],
+   237→   237→   237→   237→                "spot": matrix["spot_price"],
+   238→   238→   238→   238→                "ce_coi_sum": matrix["ce_coi_sum"],
+   239→   239→   239→   239→                "pe_coi_sum": matrix["pe_coi_sum"],
+   240→   240→   240→   240→                "state": matrix["state"],
+   241→   241→   241→   241→                "signal_type": "NEUTRAL",
+   242→   242→   242→   242→                "confidence": 0,
+   243→   243→   243→   243→            }
+   244→   244→   244→   244→            signals = self.simulator.get_7strike_signals(symbol, "")
+   245→   245→   245→   245→            if signals and signals.get("current_signal"):
+   246→   246→   246→   246→                cs = signals["current_signal"]
+   247→   247→   247→   247→                point["signal_type"] = cs["signal_type"]
+   248→   248→   248→   248→                point["confidence"] = cs["confidence"]
+   249→   249→   249→   249→                self._db.store_signal(symbol, cs)
+   250→   250→   250→   250→            self._db.store_coi_pcr_point(symbol, point)
+   251→   251→   251→   251→
+   252→   252→   252→   252→        pcr = self.simulator.get_pcr(symbol, "")
+   253→   253→   253→   253→        if pcr and pcr.get("data"):
+   254→   254→   254→   254→            last = pcr["data"][-1]
+   255→   255→   255→   255→            self._db.store_pcr_point(symbol, last)
+   256→   256→   256→   256→
+   257→   257→   257→   257→    # ================================================================
+   258→   258→   258→   258→    # Upstox Data Transformers (Live Mode)
+   259→   259→   259→   259→    # ================================================================
+   260→   260→   260→   260→
+   261→   261→   261→   261→    def _transform_upstox_chain(self, upstox_data: list, symbol: str, step: int) -> list:
+   262→   262→   262→   262→        """Transform Upstox option chain format to our internal OptionChainRow format.
+   263→   263→   263→   263→
+   264→   264→   264→   264→        Upstox returns: [{ strike_price, call_options: { market_data: {ltp, oi, change_in_oi, ...}, option_greeks: {...} },
+   265→   265→   265→   265→                          put_options: { market_data: {...}, option_greeks: {...} } }]
+   266→   266→   266→   266→        """
+   267→   267→   267→   267→        chain = []
+   268→   268→   268→   268→        for entry in upstox_data:
+   269→   269→   269→   269→            strike = _norm(entry.get("strike_price"), 0)
+   270→   270→   270→   270→            if not strike:
+   271→   271→   271→   271→                continue
+   272→   272→   272→   272→
+   273→   273→   273→   273→            call_md = (entry.get("call_options") or {}).get("market_data", {})
+   274→   274→   274→   274→            call_gk = (entry.get("call_options") or {}).get("option_greeks", {})
+   275→   275→   275→   275→            put_md = (entry.get("put_options") or {}).get("market_data", {})
+   276→   276→   276→   276→            put_gk = (entry.get("put_options") or {}).get("option_greeks", {})
+   277→   277→   277→   277→
+   278→   278→   278→   278→            chain.append({
+   279→   279→   279→   279→                "strike": strike,
+   280→   280→   280→   280→                "ce": {
+   281→   281→   281→   281→                    "instrument_key": (entry.get("call_options") or {}).get("instrument_key", ""),
+   282→   282→   282→   282→                    "ltp": _norm(call_md.get("ltp"), 0),
+   283→   283→   283→   283→                    "oi": _norm(call_md.get("oi"), 0),
+   284→   284→   284→   284→                    "change_oi": _norm(call_md.get("change_in_oi"), 0),
+   285→   285→   285→   285→                    "volume": _norm(call_md.get("volume"), 0),
+   286→   286→   286→   286→                    "iv": _norm(call_gk.get("iv"), 0),
+   287→   287→   287→   287→                    "delta": _norm(call_gk.get("delta"), 0),
+   288→   288→   288→   288→                    "gamma": _norm(call_gk.get("gamma"), 0),
+   289→   289→   289→   289→                    "theta": _norm(call_gk.get("theta"), 0),
+   290→   290→   290→   290→                    "vega": _norm(call_gk.get("vega"), 0),
+   291→   291→   291→   291→                    "bid_price": _norm(call_md.get("bid_price"), 0),
+   292→   292→   292→   292→                    "ask_price": _norm(call_md.get("ask_price"), 0),
+   293→   293→   293→   293→                },
+   294→   294→   294→   294→                "pe": {
+   295→   295→   295→   295→                    "instrument_key": (entry.get("put_options") or {}).get("instrument_key", ""),
+   296→   296→   296→   296→                    "ltp": _norm(put_md.get("ltp"), 0),
+   297→   297→   297→   297→                    "oi": _norm(put_md.get("oi"), 0),
+   298→   298→   298→   298→                    "change_oi": _norm(put_md.get("change_in_oi"), 0),
+   299→   299→   299→   299→                    "volume": _norm(put_md.get("volume"), 0),
+   300→   300→   300→   300→                    "iv": _norm(put_gk.get("iv"), 0),
+   301→   301→   301→   301→                    "delta": _norm(put_gk.get("delta"), 0),
+   302→   302→   302→   302→                    "gamma": _norm(put_gk.get("gamma"), 0),
+   303→   303→   303→   303→                    "theta": _norm(put_gk.get("theta"), 0),
+   304→   304→   304→   304→                    "vega": _norm(put_gk.get("vega"), 0),
+   305→   305→   305→   305→                    "bid_price": _norm(put_md.get("bid_price"), 0),
+   306→   306→   306→   306→                    "ask_price": _norm(put_md.get("ask_price"), 0),
+   307→   307→   307→   307→                },
+   308→   308→   308→   308→            })
+   309→   309→   309→   309→        return chain
+   310→   310→   310→   310→
+   311→   311→   311→   311→    def _compute_7strike_matrix_live(self, symbol: str, expiry: str, spot: float, atm: int, step: int, chain: list) -> Optional[dict]:
+   312→   312→   312→   312→        """Compute 7-Strike COI PCR Matrix from live option chain data."""
+   313→   313→   313→   313→        # Build 7-strike window: ATM ±3
+   314→   314→   314→   314→        window_strikes = [atm + i * step for i in range(-3, 4)]
+   315→   315→   315→   315→
+   316→   316→   316→   316→        # Map chain by strike for quick lookup
+   317→   317→   317→   317→        chain_by_strike = {r["strike"]: r for r in chain}
+   318→   318→   318→   318→
+   319→   319→   319→   319→        rows = []
+   320→   320→   320→   320→        for s in window_strikes:
+   321→   321→   321→   321→            r = chain_by_strike.get(s)
+   322→   322→   322→   322→            if r:
+   323→   323→   323→   323→                rows.append({
+   324→   324→   324→   324→                    "strike": s,
+   325→   325→   325→   325→                    "ce_coi": r["ce"]["change_oi"],
+   326→   326→   326→   326→                    "pe_coi": r["pe"]["change_oi"],
+   327→   327→   327→   327→                    "ce_oi": r["ce"]["oi"],
+   328→   328→   328→   328→                    "pe_oi": r["pe"]["oi"],
+   329→   329→   329→   329→                })
+   330→   330→   330→   330→            else:
+   331→   331→   331→   331→                rows.append({"strike": s, "ce_coi": 0, "pe_coi": 0, "ce_oi": 0, "pe_oi": 0})
+   332→   332→   332→   332→
+   333→   333→   333→   333→        ce_coi_sum = sum(r["ce_coi"] for r in rows)
+   334→   334→   334→   334→        pe_coi_sum = sum(r["pe_coi"] for r in rows)
+   335→   335→   335→   335→        coi_pcr = round(pe_coi_sum / ce_coi_sum, 3) if ce_coi_sum != 0 else 1.0
+   336→   336→   336→   336→
+   337→   337→   337→   337→        # State determination
+   338→   338→   338→   338→        if coi_pcr > 1.5 or coi_pcr < 0.6:
+   339→   339→   339→   339→            state = "ACTIVE"
+   340→   340→   340→   340→        elif coi_pcr > 1.2 or coi_pcr < 0.8:
+   341→   341→   341→   341→            state = "ZONE_WATCH"
+   342→   342→   342→   342→        else:
+   343→   343→   343→   343→            state = "IDLE"
+   344→   344→   344→   344→
+   345→   345→   345→   345→        return {
+   346→   346→   346→   346→            "underlying": symbol,
+   347→   347→   347→   347→            "expiry": expiry,
+   348→   348→   348→   348→            "spot_price": round(spot, 2),
+   349→   349→   349→   349→            "atm_strike": atm,
+   350→   350→   350→   350→            "strike_step": step,
+   351→   351→   351→   351→            "window_strikes": window_strikes,
+   352→   352→   352→   352→            "rows": rows,
+   353→   353→   353→   353→            "ce_coi_sum": ce_coi_sum,
+   354→   354→   354→   354→            "pe_coi_sum": pe_coi_sum,
+   355→   355→   355→   355→            "coi_pcr": coi_pcr,
+   356→   356→   356→   356→            "state": state,
+   357→   357→   357→   357→        }
+   358→   358→   358→   358→
+   359→   359→   359→   359→    def _compute_signals_live(self, symbol: str, expiry: str, matrix: dict) -> Optional[dict]:
+   360→   360→   360→   360→        """Compute 7-Strike signals from live matrix data."""
+   361→   361→   361→   361→        import random
+   362→   362→   362→   362→        coi_pcr = matrix["coi_pcr"]
+   363→   363→   363→   363→
+   364→   364→   364→   364→        signal_type = "NEUTRAL"
+   365→   365→   365→   365→        confidence = 0
+   366→   366→   366→   366→        reason = "No significant COI PCR divergence"
+   367→   367→   367→   367→        gate_condition = None
+   368→   368→   368→   368→        volume_percent = None
+   369→   369→   369→   369→        pain_index = None
+   370→   370→   370→   370→
+   371→   371→   371→   371→        if coi_pcr > 1.5:
+   372→   372→   372→   372→            signal_type = "LONG"
+   373→   373→   373→   373→            confidence = min(0.95, 0.5 + (coi_pcr - 1.5) * 0.3)
+   374→   374→   374→   374→            reason = f"Strong PE COI buildup (PCR: {coi_pcr:.3f}) suggests bearish resistance, bullish signal"
+   375→   375→   375→   375→            gate_condition = "LONG"
+   376→   376→   376→   376→            volume_percent = 75 + random.random() * 20
+   377→   377→   377→   377→        elif coi_pcr > 1.2:
+   378→   378→   378→   378→            signal_type = "LONG"
+   379→   379→   379→   379→            confidence = min(0.7, 0.3 + (coi_pcr - 1.2) * 0.5)
+   380→   380→   380→   380→            reason = f"Moderate PE COI dominance (PCR: {coi_pcr:.3f}), watch for confirmation"
+   381→   381→   381→   381→            gate_condition = "LONG"
+   382→   382→   382→   382→        elif coi_pcr < 0.6:
+   383→   383→   383→   383→            signal_type = "SHORT"
+   384→   384→   384→   384→            confidence = min(0.95, 0.5 + (0.6 - coi_pcr) * 0.3)
+   385→   385→   385→   385→            reason = f"Strong CE COI buildup (PCR: {coi_pcr:.3f}) suggests bullish resistance, bearish signal"
+   386→   386→   386→   386→            gate_condition = "SHORT"
+   387→   387→   387→   387→            volume_percent = 75 + random.random() * 20
+   388→   388→   388→   388→        elif coi_pcr < 0.8:
+   389→   389→   389→   389→            signal_type = "SHORT"
+   390→   390→   390→   390→            confidence = min(0.7, 0.3 + (0.8 - coi_pcr) * 0.5)
+   391→   391→   391→   391→            reason = f"Moderate CE COI dominance (PCR: {coi_pcr:.3f}), watch for confirmation"
+   392→   392→   392→   392→            gate_condition = "SHORT"
+   393→   393→   393→   393→
+   394→   394→   394→   394→        pain_index = coi_pcr > 1 and matrix["atm_strike"] + (coi_pcr - 1) * 50 or matrix["atm_strike"] - (1 - coi_pcr) * 50
+   395→   395→   395→   395→
+   396→   396→   396→   396→        current_signal = {
+   397→   397→   397→   397→            "signal_type": signal_type,
+   398→   398→   398→   398→            "confidence": round(confidence, 3),
+   399→   399→   399→   399→            "reason": reason,
+   400→   400→   400→   400→            "timestamp": int(time.time() * 1000),
+   401→   401→   401→   401→            "spot_price": matrix["spot_price"],
+   402→   402→   402→   402→            "coi_pcr": coi_pcr,
+   403→   403→   403→   403→            "volume_percent": volume_percent,
+   404→   404→   404→   404→            "gate_condition": gate_condition,
+   405→   405→   405→   405→            "pain_index": round(pain_index, 1),
+   406→   406→   406→   406→        }
+   407→   407→   407→   407→
+   408→   408→   408→   408→        # Get recent signals from DB
+   409→   409→   409→   409→        db_signals = self._db.get_signals(symbol, 20)
+   410→   410→   410→   410→
+   411→   411→   411→   411→        return {
+   412→   412→   412→   412→            "underlying": symbol,
+   413→   413→   413→   413→            "expiry": expiry,
+   414→   414→   414→   414→            "signals": db_signals,
+   415→   415→   415→   415→            "current_signal": current_signal,
+   416→   416→   416→   416→            "gate_condition": gate_condition or "NONE",
+   417→   417→   417→   417→            "state": matrix["state"],
+   418→   418→   418→   418→        }
+   419→   419→   419→   419→
+   420→   420→   420→   420→    # ================================================================
+   421→   421→   421→   421→    # Public Data Access Methods — AUTO SWITCH LIVE/SIM
+   422→   422→   422→   422→    # ================================================================
+   423→   423→   423→   423→
+   424→   424→   424→   424→    async def get_candles_async(self, instrument_key: str, timeframe: str) -> list:
+   425→   425→   425→   425→        """Get candle data. LIVE mode fetches from Upstox, SIM uses simulator."""
+   426→   426→   426→   426→        if self.mode == "live" and self.upstox:
+   427→   427→   427→   427→            result = await self.upstox.get_candles(instrument_key, timeframe)
+   428→   428→   428→   428→            if result.get("success") and result.get("data"):
+   429→   429→   429→   429→                # Transform Upstox candle format
+   430→   430→   430→   430→                candles = []
+   431→   431→   431→   431→                for c in result["data"]:
+   432→   432→   432→   432→                    try:
+   433→   433→   433→   433→                        ts = c[0] if isinstance(c[0], (int, float)) else int(c[0])
+   434→   434→   434→   434→                        # Upstox returns [timestamp, open, high, low, close, volume]
+   435→   435→   435→   435→                        candles.append({
+   436→   436→   436→   436→                            "time": int(ts) if ts > 1e12 else int(ts),
+   437→   437→   437→   437→                            "open": float(c[1]),
+   438→   438→   438→   438→                            "high": float(c[2]),
+   439→   439→   439→   439→                            "low": float(c[3]),
+   440→   440→   440→   440→                            "close": float(c[4]),
+   441→   441→   441→   441→                            "volume": int(c[5]) if len(c) > 5 else 0,
+   442→   442→   442→   442→                        })
+   443→   443→   443→   443→                    except (IndexError, ValueError, TypeError):
+   444→   444→   444→   444→                        continue
+   445→   445→   445→   445→                if candles:
+   446→   446→   446→   446→                    return candles
+   447→   447→   447→   447→        return self.simulator.get_candles(instrument_key, timeframe)
+   448→   448→   448→   448→
+   449→   449→   449→   449→    def get_candles(self, instrument_key: str, timeframe: str) -> list:
+   450→   450→   450→   450→        """Synchronous candle fetch (uses DB cache in live mode)."""
+   451→   451→   451→   451→        # In live mode, check DB first
+   452→   452→   452→   452→        if self.mode == "live":
+   453→   453→   453→   453→            db_candles = self._db.get_candles(instrument_key, timeframe)
+   454→   454→   454→   454→            if db_candles:
+   455→   455→   455→   455→                return db_candles
+   456→   456→   456→   456→        return self.simulator.get_candles(instrument_key, timeframe)
+   457→   457→   457→   457→
+   458→   458→   458→   458→    async def get_option_chain_async(self, underlying: str, expiry: str) -> dict:
+   459→   459→   459→   459→        """Get option chain. LIVE mode fetches from Upstox."""
+   460→   460→   460→   460→        if self.mode == "live" and self.upstox:
+   461→   461→   461→   461→            result = await self.upstox.get_option_chain(underlying, expiry)
+   462→   462→   462→   462→            if result.get("success") and result.get("data"):
+   463→   463→   463→   463→                config = UNDERLYING_CONFIG.get(underlying, {})
+   464→   464→   464→   464→                step = config.get("strike_step", 50)
+   465→   465→   465→   465→                spot = result.get("spot_price", 0)
+   466→   466→   466→   466→                atm = round(spot / step) * step if spot else 0
+   467→   467→   467→   467→                chain = self._transform_upstox_chain(result["data"], underlying, step)
+   468→   468→   468→   468→                return {
+   469→   469→   469→   469→                    "underlying": underlying,
+   470→   470→   470→   470→                    "expiry": expiry,
+   471→   471→   471→   471→                    "spot_price": round(spot, 2),
+   472→   472→   472→   472→                    "atm_strike": atm,
+   473→   473→   473→   473→                    "strike_step": step,
+   474→   474→   474→   474→                    "chain": chain,
+   475→   475→   475→   475→                }
+   476→   476→   476→   476→        return self.simulator.get_option_chain(underlying, expiry)
+   477→   477→   477→   477→
+   478→   478→   478→   478→    def get_option_chain(self, underlying: str, expiry: str) -> dict:
+   479→   479→   479→   479→        """Get option chain (sync — uses cached live data or simulator)."""
+   480→   480→   480→   480→        if self.mode == "live" and underlying in self._live_chain_cache:
+   481→   481→   481→   481→            cached = self._live_chain_cache[underlying]
+   482→   482→   482→   482→            return {
+   483→   483→   483→   483→                "underlying": underlying,
+   484→   484→   484→   484→                "expiry": expiry,
+   485→   485→   485→   485→                "spot_price": cached["spot_price"],
+   486→   486→   486→   486→                "atm_strike": cached["atm_strike"],
+   487→   487→   487→   487→                "strike_step": cached["strike_step"],
+   488→   488→   488→   488→                "chain": cached["chain"],
+   489→   489→   489→   489→            }
+   490→   490→   490→   490→        return self.simulator.get_option_chain(underlying, expiry)
+   491→   491→   491→   491→
+   492→   492→   492→   492→    async def get_mini_option_chain_async(self, underlying: str, expiry: str) -> dict:
+   493→   493→   493→   493→        """Get mini option chain. LIVE mode uses Upstox data."""
+   494→   494→   494→   494→        full = await self.get_option_chain_async(underlying, expiry)
+   495→   495→   495→   495→        atm = full.get("atm_strike", 0)
+   496→   496→   496→   496→        step = full.get("strike_step", 50)
+   497→   497→   497→   497→        # Filter to ATM ±10 strikes
+   498→   498→   498→   498→        filtered = [r for r in full.get("chain", []) if atm - 10 * step <= r["strike"] <= atm + 10 * step]
+   499→   499→   499→   499→        return {
+   500→   500→   500→   500→            "underlying": full["underlying"],
+   501→   501→   501→   501→            "expiry": full["expiry"],
+   502→   502→   502→   502→            "spot_price": full["spot_price"],
+   503→   503→   503→   503→            "atm_strike": atm,
+   504→   504→   504→   504→            "strike_step": step,
+   505→   505→   505→   505→            "chain": [{
+   506→   506→   506→   506→                "strike": r["strike"],
+   507→   507→   507→   507→                "ce": {k: v for k, v in r["ce"].items() if k not in ("gamma", "theta", "vega")},
+   508→   508→   508→   508→                "pe": {k: v for k, v in r["pe"].items() if k not in ("gamma", "theta", "vega")},
+   509→   509→   509→   509→            } for r in filtered],
+   510→   510→   510→   510→        }
+   511→   511→   511→   511→
+   512→   512→   512→   512→    def get_mini_option_chain(self, underlying: str, expiry: str) -> dict:
+   513→   513→   513→   513→        """Synchronous mini option chain."""
+   514→   514→   514→   514→        full = self.get_option_chain(underlying, expiry)
+   515→   515→   515→   515→        atm = full.get("atm_strike", 0)
+   516→   516→   516→   516→        step = full.get("strike_step", 50)
+   517→   517→   517→   517→        filtered = [r for r in full.get("chain", []) if atm - 10 * step <= r["strike"] <= atm + 10 * step]
+   518→   518→   518→   518→        return {
+   519→   519→   519→   519→            "underlying": full["underlying"],
+   520→   520→   520→   520→            "expiry": full["expiry"],
+   521→   521→   521→   521→            "spot_price": full["spot_price"],
+   522→   522→   522→   522→            "atm_strike": atm,
+   523→   523→   523→   523→            "strike_step": step,
+   524→   524→   524→   524→            "chain": [{
+   525→   525→   525→   525→                "strike": r["strike"],
+   526→   526→   526→   526→                "ce": {k: v for k, v in r["ce"].items() if k not in ("gamma", "theta", "vega")},
+   527→   527→   527→   527→                "pe": {k: v for k, v in r["pe"].items() if k not in ("gamma", "theta", "vega")},
+   528→   528→   528→   528→            } for r in filtered],
+   529→   529→   529→   529→        }
+   530→   530→   530→   530→
+   531→   531→   531→   531→    async def get_oi_data_async(self, underlying: str, expiry: str) -> dict:
+   532→   532→   532→   532→        """Get OI data. LIVE mode from Upstox."""
+   533→   533→   533→   533→        if self.mode == "live" and underlying in self._live_chain_cache:
+   534→   534→   534→   534→            cached = self._live_chain_cache[underlying]
+
+[showing lines 35-534 of 758; use offset=535 with limit to continue reading]

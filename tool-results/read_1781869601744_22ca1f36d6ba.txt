@@ -1,0 +1,935 @@
+     1→     1→"""
+     2→     2→Realistic market data simulator for Indian index options.
+     3→     3→Generates simulated NIFTY/BANKNIFTY spot prices, option chains,
+     4→     4→OI data, and candlestick data for demo mode.
+     5→     5→"""
+     6→     6→import math
+     7→     7→import random
+     8→     8→import time
+     9→     9→from datetime import datetime, timedelta
+    10→    10→from typing import Optional
+    11→    11→
+    12→    12→from config import NIFTY_CONFIG, BANKNIFTY_CONFIG, UNDERLYINGS
+    13→    13→
+    14→    14→
+    15→    15→def _next_thursday(from_date: datetime = None) -> datetime:
+    16→    16→    """Get the next Thursday from a given date (for weekly expiry)."""
+    17→    17→    if from_date is None:
+    18→    18→        from_date = datetime.now()
+    19→    19→    days_until_thursday = (3 - from_date.weekday()) % 7
+    20→    20→    if days_until_thursday == 0 and from_date.hour >= 16:
+    21→    21→        days_until_thursday = 7
+    22→    22→    if days_until_thursday == 0:
+    23→    23→        days_until_thursday = 7  # Always use future Thursday
+    24→    24→    expiry = from_date + timedelta(days=days_until_thursday)
+    25→    25→    return expiry.replace(hour=0, minute=0, second=0, microsecond=0)
+    26→    26→
+    27→    27→
+    28→    28→def _format_expiry_label(dt: datetime) -> str:
+    29→    29→    """Format expiry date in human-readable form: '26 Jun 2026'."""
+    30→    30→    months = [
+    31→    31→        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    32→    32→        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    33→    33→    ]
+    34→    34→    return f"{dt.day:02d} {months[dt.month - 1]} {dt.year}"
+    35→    35→
+    36→    36→
+    37→    37→def _format_expiry_short(dt: datetime) -> str:
+    38→    38→    """Format expiry in YYMMDD format."""
+    39→    39→    return dt.strftime("%y%m%d")
+    40→    40→
+    41→    41→
+    42→    42→def _get_expiry_dates(underlying: str = "NIFTY", count: int = 5) -> list[datetime]:
+    43→    43→    """Get upcoming weekly expiry dates."""
+    44→    44→    expiries = []
+    45→    45→    base = datetime.now()
+    46→    46→    for i in range(count):
+    47→    47→        expiry = _next_thursday(base + timedelta(days=7 * i))
+    48→    48→        expiries.append(expiry)
+    49→    49→    return expiries
+    50→    50→
+    51→    51→
+    52→    52→def _atm_strike(spot: float, step: int) -> float:
+    53→    53→    """Calculate the ATM strike from spot price."""
+    54→    54→    return round(spot / step) * step
+    55→    55→
+    56→    56→
+    57→    57→def _normal_cdf(x: float) -> float:
+    58→    58→    """Approximate cumulative normal distribution."""
+    59→    59→    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+    60→    60→
+    61→    61→
+    62→    62→def _bs_delta(spot: float, strike: float, tte: float, iv: float, option_type: str) -> float:
+    63→    63→    """Calculate Black-Scholes delta."""
+    64→    64→    if tte <= 0 or iv <= 0:
+    65→    65→        return 0.0
+    66→    66→    d1 = (math.log(spot / strike) + (0.05 + 0.5 * iv ** 2) * tte) / (iv * math.sqrt(tte))
+    67→    67→    if option_type == "CE":
+    68→    68→        return _normal_cdf(d1)
+    69→    69→    else:
+    70→    70→        return _normal_cdf(d1) - 1.0
+    71→    71→
+    72→    72→
+    73→    73→def _bs_price(spot: float, strike: float, tte: float, iv: float, option_type: str) -> float:
+    74→    74→    """Calculate Black-Scholes option price (simplified)."""
+    75→    75→    if tte <= 0 or iv <= 0:
+    76→    76→        intrinsic = max(0, spot - strike) if option_type == "CE" else max(0, strike - spot)
+    77→    77→        return intrinsic
+    78→    78→    d1 = (math.log(spot / strike) + (0.05 + 0.5 * iv ** 2) * tte) / (iv * math.sqrt(tte))
+    79→    79→    d2 = d1 - iv * math.sqrt(tte)
+    80→    80→    if option_type == "CE":
+    81→    81→        price = spot * _normal_cdf(d1) - strike * math.exp(-0.05 * tte) * _normal_cdf(d2)
+    82→    82→    else:
+    83→    83→        price = strike * math.exp(-0.05 * tte) * _normal_cdf(-d2) - spot * _normal_cdf(-d1)
+    84→    84→    return max(0.05, round(price, 2))
+    85→    85→
+    86→    86→
+    87→    87→def _bs_greeks(spot: float, strike: float, tte: float, iv: float, option_type: str) -> dict:
+    88→    88→    """Calculate Black-Scholes greeks."""
+    89→    89→    if tte <= 0 or iv <= 0:
+    90→    90→        tte = 1.0 / 365.0
+    91→    91→        iv = 0.15
+    92→    92→
+    93→    93→    d1 = (math.log(spot / strike) + (0.05 + 0.5 * iv ** 2) * tte) / (iv * math.sqrt(tte))
+    94→    94→    d2 = d1 - iv * math.sqrt(tte)
+    95→    95→
+    96→    96→    # Delta
+    97→    97→    if option_type == "CE":
+    98→    98→        delta = _normal_cdf(d1)
+    99→    99→    else:
+   100→   100→        delta = _normal_cdf(d1) - 1.0
+   101→   101→
+   102→   102→    # Gamma
+   103→   103→    gamma = math.exp(-0.5 * d1 ** 2) / (spot * iv * math.sqrt(tte) * math.sqrt(2 * math.pi))
+   104→   104→
+   105→   105→    # Theta (per day)
+   106→   106→    theta_term1 = -(spot * iv * math.exp(-0.5 * d1 ** 2)) / (2 * math.sqrt(2 * math.pi * tte))
+   107→   107→    if option_type == "CE":
+   108→   108→        theta = (theta_term1 - 0.05 * strike * math.exp(-0.05 * tte) * _normal_cdf(d2)) / 365.0
+   109→   109→    else:
+   110→   110→        theta = (theta_term1 + 0.05 * strike * math.exp(-0.05 * tte) * _normal_cdf(-d2)) / 365.0
+   111→   111→
+   112→   112→    # Vega (per 1% change in vol)
+   113→   113→    vega = spot * math.sqrt(tte) * math.exp(-0.5 * d1 ** 2) / math.sqrt(2 * math.pi) / 100.0
+   114→   114→
+   115→   115→    return {
+   116→   116→        "delta": round(delta, 4),
+   117→   117→        "gamma": round(gamma, 4),
+   118→   118→        "theta": round(theta, 2),
+   119→   119→        "vega": round(vega, 2),
+   120→   120→    }
+   121→   121→
+   122→   122→
+   123→   123→class MarketDataSimulator:
+   124→   124→    """
+   125→   125→    Generates realistic simulated market data for Indian index options.
+   126→   126→    Maintains state across ticks to create continuous, realistic price action.
+   127→   127→    """
+   128→   128→
+   129→   129→    def __init__(self):
+   130→   130→        # Spot prices for each underlying
+   131→   131→        self._spot: dict[str, float] = {}
+   132→   132→        self._prev_spot: dict[str, float] = {}
+   133→   133→        self._open_spot: dict[str, float] = {}  # Day's opening price
+   134→   134→
+   135→   135→        # Tick counter per underlying
+   136→   136→        self._tick_count: dict[str, int] = {}
+   137→   137→
+   138→   138→        # OI tracking: instrument_key -> { "open_oi": int, "current_oi": int }
+   139→   139→        self._oi_state: dict[str, dict] = {}
+   140→   140→
+   141→   141→        # Candle state: instrument_key+timeframe -> { "candles": [...], "current": {...} }
+   142→   142→        self._candle_state: dict[str, dict] = {}
+   143→   143→
+   144→   144→        # Expiry dates
+   145→   145→        self._expiries: dict[str, list[datetime]] = {}
+   146→   146→
+   147→   147→        # Initialize
+   148→   148→        for symbol, config in UNDERLYINGS.items():
+   149→   149→            self._spot[symbol] = config["base_price"] + random.uniform(-100, 100)
+   150→   150→            self._prev_spot[symbol] = self._spot[symbol]
+   151→   151→            self._open_spot[symbol] = self._spot[symbol]
+   152→   152→            self._tick_count[symbol] = 0
+   153→   153→            self._expiries[symbol] = _get_expiry_dates(symbol)
+   154→   154→
+   155→   155→    # ---------- Public API ----------
+   156→   156→
+   157→   157→    def get_spot(self, underlying: str) -> float:
+   158→   158→        """Get current spot price."""
+   159→   159→        return self._spot.get(underlying, UNDERLYINGS.get(underlying, NIFTY_CONFIG)["base_price"])
+   160→   160→
+   161→   161→    def get_prev_spot(self, underlying: str) -> float:
+   162→   162→        """Get previous spot price."""
+   163→   163→        return self._prev_spot.get(underlying, self.get_spot(underlying))
+   164→   164→
+   165→   165→    def get_open_spot(self, underlying: str) -> float:
+   166→   166→        """Get day's opening spot price."""
+   167→   167→        return self._open_spot.get(underlying, self.get_spot(underlying))
+   168→   168→
+   169→   169→    def get_atm_strike(self, underlying: str) -> float:
+   170→   170→        """Get ATM strike for current spot."""
+   171→   171→        config = UNDERLYINGS.get(underlying, NIFTY_CONFIG)
+   172→   172→        return _atm_strike(self.get_spot(underlying), config["strike_step"])
+   173→   173→
+   174→   174→    def get_expiries(self, underlying: str) -> list[dict]:
+   175→   175→        """Get expiry dates for an underlying."""
+   176→   176→        dates = self._expiries.get(underlying, self._expiries.get("NIFTY", []))
+   177→   177→        result = []
+   178→   178→        today = datetime.now()
+   179→   179→        for d in dates:
+   180→   180→            dte = (d - today).days
+   181→   181→            if dte < 0:
+   182→   182→                dte = 0
+   183→   183→            result.append({
+   184→   184→                "underlying": underlying,
+   185→   185→                "expiry_date": d.strftime("%Y-%m-%d"),
+   186→   186→                "expiry_label": _format_expiry_label(d),
+   187→   187→                "is_weekly": True,
+   188→   188→                "days_to_expiry": dte,
+   189→   189→            })
+   190→   190→        return result
+   191→   191→
+   192→   192→    def get_instruments(self, underlying: str, expiry: str) -> list[dict]:
+   193→   193→        """Get all option instruments for an underlying + expiry."""
+   194→   194→        config = UNDERLYINGS.get(underlying, NIFTY_CONFIG)
+   195→   195→        spot = self.get_spot(underlying)
+   196→   196→        atm = _atm_strike(spot, config["strike_step"])
+   197→   197→        step = config["strike_step"]
+   198→   198→
+   199→   199→        instruments = []
+   200→   200→        for i in range(-config["atm_strikes_range"], config["atm_strikes_range"] + 1):
+   201→   201→            strike = atm + i * step
+   202→   202→            for opt_type in ["CE", "PE"]:
+   203→   203→                key = self._make_instrument_key(underlying, expiry, strike, opt_type)
+   204→   204→                ts = self._make_trading_symbol(underlying, expiry, strike, opt_type)
+   205→   205→                instruments.append({
+   206→   206→                    "instrument_key": key,
+   207→   207→                    "trading_symbol": ts,
+   208→   208→                    "name": f"{underlying} {int(strike)} {opt_type}",
+   209→   209→                    "expiry": expiry,
+   210→   210→                    "strike": strike,
+   211→   211→                    "option_type": opt_type,
+   212→   212→                    "lot_size": config["lot_size"],
+   213→   213→                    "underlying": underlying,
+   214→   214→                    "exchange": "NSE_FO",
+   215→   215→                    "tick_size": 0.05,
+   216→   216→                })
+   217→   217→        return instruments
+   218→   218→
+   219→   219→    def search_instruments(self, query: str) -> list[dict]:
+   220→   220→        """Search instruments by human-readable query."""
+   221→   221→        query_upper = query.upper().strip()
+   222→   222→        results = []
+   223→   223→
+   224→   224→        for symbol in UNDERLYINGS:
+   225→   225→            expiries = self._expiries.get(symbol, [])
+   226→   226→            if not expiries:
+   227→   227→                continue
+   228→   228→            expiry = expiries[0]
+   229→   229→            expiry_str = expiry.strftime("%Y-%m-%d")
+   230→   230→            instruments = self.get_instruments(symbol, expiry_str)
+   231→   231→
+   232→   232→            for inst in instruments:
+   233→   233→                # Match against name, trading_symbol, instrument_key
+   234→   234→                searchable = f"{inst['name']} {inst['trading_symbol']} {inst['instrument_key']}".upper()
+   235→   235→                if query_upper in searchable:
+   236→   236→                    results.append(inst)
+   237→   237→
+   238→   238→        return results
+   239→   239→
+   240→   240→    def generate_tick(self, underlying: str) -> dict:
+   241→   241→        """
+   242→   242→        Generate a single tick of simulated data.
+   243→   243→        Returns spot tick data and updates all internal state.
+   244→   244→        """
+   245→   245→        config = UNDERLYINGS.get(underlying, NIFTY_CONFIG)
+   246→   246→        self._tick_count[underlying] = self._tick_count.get(underlying, 0) + 1
+   247→   247→        tick_num = self._tick_count[underlying]
+   248→   248→
+   249→   249→        # Update spot price with realistic random walk
+   250→   250→        self._prev_spot[underlying] = self._spot[underlying]
+   251→   251→
+   252→   252→        # Volatility with intraday patterns
+   253→   253→        vol = config["volatility_daily"] / math.sqrt(375 * 60)  # ~375 min * 60 sec
+   254→   254→
+   255→   255→        # Add mean reversion to base price
+   256→   256→        base = config["base_price"]
+   257→   257→        current = self._spot[underlying]
+   258→   258→        mean_reversion = (base - current) * 0.0001
+   259→   259→
+   260→   260→        # Add momentum (trend continuation)
+   261→   261→        momentum = (current - self._prev_spot[underlying]) * 0.05
+   262→   262→
+   263→   263→        # Random noise
+   264→   264→        noise = random.gauss(0, vol * current)
+   265→   265→
+   266→   266→        # Occasional larger moves (simulates institutional activity)
+   267→   267→        if random.random() < 0.02:
+   268→   268→            noise += random.gauss(0, vol * current * 5)
+   269→   269→
+   270→   270→        new_spot = current + mean_reversion + momentum + noise
+   271→   271→        # Round to 2 decimal places
+   272→   272→        new_spot = round(new_spot, 2)
+   273→   273→        self._spot[underlying] = new_spot
+   274→   274→
+   275→   275→        spot = self._spot[underlying]
+   276→   276→        open_price = self._open_spot[underlying]
+   277→   277→        change = round(spot - open_price, 2)
+   278→   278→        change_pct = round((change / open_price) * 100, 2) if open_price != 0 else 0.0
+   279→   279→
+   280→   280→        now_ms = int(time.time() * 1000)
+   281→   281→
+   282→   282→        return {
+   283→   283→            "symbol": underlying,
+   284→   284→            "ltp": spot,
+   285→   285→            "change": change,
+   286→   286→            "change_pct": change_pct,
+   287→   287→            "timestamp": now_ms,
+   288→   288→        }
+   289→   289→
+   290→   290→    def generate_option_chain(self, underlying: str, expiry: str) -> dict:
+   291→   291→        """Generate full option chain data for an underlying + expiry."""
+   292→   292→        config = UNDERLYINGS.get(underlying, NIFTY_CONFIG)
+   293→   293→        spot = self.get_spot(underlying)
+   294→   294→        atm = _atm_strike(spot, config["strike_step"])
+   295→   295→        step = config["strike_step"]
+   296→   296→
+   297→   297→        # Parse expiry to get time to expiry
+   298→   298→        expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
+   299→   299→        now = datetime.now()
+   300→   300→        tte = max((expiry_dt - now).total_seconds() / (365.25 * 24 * 3600), 1.0 / 365.0)
+   301→   301→
+   302→   302→        now_ms = int(time.time() * 1000)
+   303→   303→
+   304→   304→        chain = []
+   305→   305→        for i in range(-config["atm_strikes_range"], config["atm_strikes_range"] + 1):
+   306→   306→            strike = atm + i * step
+   307→   307→            row = {"strike": strike, "ce": None, "pe": None}
+   308→   308→
+   309→   309→            for opt_type in ["CE", "PE"]:
+   310→   310→                key = self._make_instrument_key(underlying, expiry, strike, opt_type)
+   311→   311→
+   312→   312→                # IV: ATM ~13%, increases as we go OTM (volatility smile)
+   313→   313→                moneyness = abs(spot - strike) / spot
+   314→   314→                base_iv = 0.13
+   315→   315→                iv = base_iv + moneyness * 0.8 + random.uniform(-0.005, 0.005)
+   316→   316→
+   317→   317→                # Calculate premium using BS
+   318→   318→                ltp = _bs_price(spot, strike, tte, iv, opt_type)
+   319→   319→                # Add some noise to LTP
+   320→   320→                ltp = max(0.05, round(ltp + random.gauss(0, ltp * 0.01), 2))
+   321→   321→
+   322→   322→                # Greeks
+   323→   323→                greeks = _bs_greeks(spot, strike, tte, iv, opt_type)
+   324→   324→
+   325→   325→                # OI and Change OI - realistic patterns
+   326→   326→                oi, change_oi = self._simulate_oi(
+   327→   327→                    underlying, key, strike, atm, opt_type, step
+   328→   328→                )
+   329→   329→
+   330→   330→                # Volume - higher near ATM, decreases for far strikes
+   331→   331→                dist_from_atm = abs(strike - atm)
+   332→   332→                base_volume = max(100, int(50000 * math.exp(-dist_from_atm / (step * 3))))
+   333→   333→                volume = max(0, base_volume + random.randint(-base_volume // 5, base_volume // 5))
+   334→   334→
+   335→   335→                # Bid/Ask spread
+   336→   336→                spread = max(0.05, round(ltp * 0.005, 2))
+   337→   337→                bid_price = round(max(0.05, ltp - spread / 2), 2)
+   338→   338→                ask_price = round(ltp + spread / 2, 2)
+   339→   339→                bid_qty = random.randint(10, 500)
+   340→   340→                ask_qty = random.randint(10, 500)
+   341→   341→
+   342→   342→                strike_data = {
+   343→   343→                    "strike": strike,
+   344→   344→                    "option_type": opt_type,
+   345→   345→                    "instrument_key": key,
+   346→   346→                    "trading_symbol": self._make_trading_symbol(underlying, expiry, strike, opt_type),
+   347→   347→                    "ltp": ltp,
+   348→   348→                    "volume": volume,
+   349→   349→                    "oi": oi,
+   350→   350→                    "change_oi": change_oi,
+   351→   351→                    "iv": round(iv, 4),
+   352→   352→                    "delta": greeks["delta"],
+   353→   353→                    "gamma": greeks["gamma"],
+   354→   354→                    "theta": greeks["theta"],
+   355→   355→                    "vega": greeks["vega"],
+   356→   356→                    "bid_price": bid_price,
+   357→   357→                    "ask_price": ask_price,
+   358→   358→                    "bid_qty": bid_qty,
+   359→   359→                    "ask_qty": ask_qty,
+   360→   360→                }
+   361→   361→
+   362→   362→                if opt_type == "CE":
+   363→   363→                    row["ce"] = strike_data
+   364→   364→                else:
+   365→   365→                    row["pe"] = strike_data
+   366→   366→
+   367→   367→            chain.append(row)
+   368→   368→
+   369→   369→        return {
+   370→   370→            "underlying": underlying,
+   371→   371→            "expiry": expiry,
+   372→   372→            "spot_price": spot,
+   373→   373→            "atm_strike": atm,
+   374→   374→            "strike_step": step,
+   375→   375→            "chain": chain,
+   376→   376→        }
+   377→   377→
+   378→   378→    def generate_mini_option_chain(self, underlying: str, expiry: str) -> dict:
+   379→   379→        """Generate mini option chain (ATM +/- 5 strikes)."""
+   380→   380→        config = UNDERLYINGS.get(underlying, NIFTY_CONFIG)
+   381→   381→        spot = self.get_spot(underlying)
+   382→   382→        atm = _atm_strike(spot, config["strike_step"])
+   383→   383→        step = config["strike_step"]
+   384→   384→
+   385→   385→        expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
+   386→   386→        now = datetime.now()
+   387→   387→        tte = max((expiry_dt - now).total_seconds() / (365.25 * 24 * 3600), 1.0 / 365.0)
+   388→   388→
+   389→   389→        now_ms = int(time.time() * 1000)
+   390→   390→        chain = []
+   391→   391→
+   392→   392→        for i in range(-5, 6):
+   393→   393→            strike = atm + i * step
+   394→   394→            row = {"strike": strike, "ce": None, "pe": None}
+   395→   395→
+   396→   396→            for opt_type in ["CE", "PE"]:
+   397→   397→                key = self._make_instrument_key(underlying, expiry, strike, opt_type)
+   398→   398→
+   399→   399→                moneyness = abs(spot - strike) / spot
+   400→   400→                base_iv = 0.13
+   401→   401→                iv = base_iv + moneyness * 0.8 + random.uniform(-0.005, 0.005)
+   402→   402→
+   403→   403→                ltp = _bs_price(spot, strike, tte, iv, opt_type)
+   404→   404→                ltp = max(0.05, round(ltp + random.gauss(0, ltp * 0.01), 2))
+   405→   405→
+   406→   406→                greeks = _bs_greeks(spot, strike, tte, iv, opt_type)
+   407→   407→
+   408→   408→                oi, change_oi = self._simulate_oi(
+   409→   409→                    underlying, key, strike, atm, opt_type, step
+   410→   410→                )
+   411→   411→
+   412→   412→                dist_from_atm = abs(strike - atm)
+   413→   413→                base_volume = max(100, int(50000 * math.exp(-dist_from_atm / (step * 3))))
+   414→   414→                volume = max(0, base_volume + random.randint(-base_volume // 5, base_volume // 5))
+   415→   415→
+   416→   416→                spread = max(0.05, round(ltp * 0.005, 2))
+   417→   417→                bid_price = round(max(0.05, ltp - spread / 2), 2)
+   418→   418→                ask_price = round(ltp + spread / 2, 2)
+   419→   419→
+   420→   420→                strike_data = {
+   421→   421→                    "strike": strike,
+   422→   422→                    "option_type": opt_type,
+   423→   423→                    "instrument_key": key,
+   424→   424→                    "trading_symbol": self._make_trading_symbol(underlying, expiry, strike, opt_type),
+   425→   425→                    "ltp": ltp,
+   426→   426→                    "volume": volume,
+   427→   427→                    "oi": oi,
+   428→   428→                    "change_oi": change_oi,
+   429→   429→                    "iv": round(iv, 4),
+   430→   430→                    "delta": greeks["delta"],
+   431→   431→                    "gamma": greeks["gamma"],
+   432→   432→                    "theta": greeks["theta"],
+   433→   433→                    "vega": greeks["vega"],
+   434→   434→                    "bid_price": bid_price,
+   435→   435→                    "ask_price": ask_price,
+   436→   436→                    "bid_qty": random.randint(10, 500),
+   437→   437→                    "ask_qty": random.randint(10, 500),
+   438→   438→                }
+   439→   439→
+   440→   440→                if opt_type == "CE":
+   441→   441→                    row["ce"] = strike_data
+   442→   442→                else:
+   443→   443→                    row["pe"] = strike_data
+   444→   444→
+   445→   445→            chain.append(row)
+   446→   446→
+   447→   447→        return {
+   448→   448→            "underlying": underlying,
+   449→   449→            "expiry": expiry,
+   450→   450→            "spot_price": spot,
+   451→   451→            "atm_strike": atm,
+   452→   452→            "strike_step": step,
+   453→   453→            "chain": chain,
+   454→   454→        }
+   455→   455→
+   456→   456→    def generate_option_tick(self, underlying: str, expiry: str, strike: float, opt_type: str) -> dict:
+   457→   457→        """Generate a single option tick."""
+   458→   458→        config = UNDERLYINGS.get(underlying, NIFTY_CONFIG)
+   459→   459→        spot = self.get_spot(underlying)
+   460→   460→        key = self._make_instrument_key(underlying, expiry, strike, opt_type)
+   461→   461→
+   462→   462→        expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
+   463→   463→        tte = max((expiry_dt - datetime.now()).total_seconds() / (365.25 * 24 * 3600), 1.0 / 365.0)
+   464→   464→
+   465→   465→        moneyness = abs(spot - strike) / spot if spot > 0 else 0
+   466→   466→        iv = 0.13 + moneyness * 0.8 + random.uniform(-0.005, 0.005)
+   467→   467→        ltp = _bs_price(spot, strike, tte, iv, opt_type)
+   468→   468→        ltp = max(0.05, round(ltp + random.gauss(0, ltp * 0.01), 2))
+   469→   469→
+   470→   470→        oi, change_oi = self._simulate_oi(underlying, key, strike, _atm_strike(spot, config["strike_step"]), opt_type, config["strike_step"])
+   471→   471→
+   472→   472→        dist_from_atm = abs(strike - _atm_strike(spot, config["strike_step"]))
+   473→   473→        base_volume = max(100, int(50000 * math.exp(-dist_from_atm / (config["strike_step"] * 3))))
+   474→   474→        volume = max(0, base_volume + random.randint(-base_volume // 5, base_volume // 5))
+   475→   475→
+   476→   476→        spread = max(0.05, round(ltp * 0.005, 2))
+   477→   477→
+   478→   478→        now_ms = int(time.time() * 1000)
+   479→   479→
+   480→   480→        return {
+   481→   481→            "instrument_key": key,
+   482→   482→            "strike": strike,
+   483→   483→            "option_type": opt_type,
+   484→   484→            "ltp": ltp,
+   485→   485→            "volume": volume,
+   486→   486→            "oi": oi,
+   487→   487→            "change_oi": change_oi,
+   488→   488→            "bid_price": round(max(0.05, ltp - spread / 2), 2),
+   489→   489→            "ask_price": round(ltp + spread / 2, 2),
+   490→   490→            "timestamp": now_ms,
+   491→   491→        }
+   492→   492→
+   493→   493→    def generate_oi_data(self, instrument_key: str, count: int = 100) -> dict:
+   494→   494→        """Generate OI time series data for an instrument."""
+   495→   495→        # Parse instrument key to get details
+   496→   496→        parts = instrument_key.split("|")
+   497→   497→        if len(parts) < 2:
+   498→   498→            return {"instrument_key": instrument_key, "data": []}
+   499→   499→
+   500→   500→        # Generate realistic OI progression
+   501→   501→        now_ms = int(time.time() * 1000)
+   502→   502→        data = []
+   503→   503→
+   504→   504→        # Start OI
+   505→   505→        base_oi = random.randint(50000, 500000)
+   506→   506→        current_oi = base_oi
+   507→   507→
+   508→   508→        for i in range(count):
+   509→   509→            ts = now_ms - (count - i) * 60000  # 1-minute intervals
+   510→   510→
+   511→   511→            # OI changes follow patterns: buildup in morning, reduction near expiry
+   512→   512→            oi_change = random.randint(-5000, 8000)
+   513→   513→            # Bias towards buildup in morning
+   514→   514→            hour = datetime.fromtimestamp(ts / 1000).hour
+   515→   515→            if 9 <= hour <= 11:
+   516→   516→                oi_change = int(oi_change * 1.5)  # More buildup in morning
+   517→   517→
+   518→   518→            current_oi = max(1000, current_oi + oi_change)
+   519→   519→            change_oi = current_oi - base_oi
+   520→   520→
+   521→   521→            data.append({
+   522→   522→                "timestamp": ts,
+   523→   523→                "oi": current_oi,
+   524→   524→                "change_oi": change_oi,
+   525→   525→            })
+   526→   526→
+   527→   527→        return {"instrument_key": instrument_key, "data": data}
+   528→   528→
+   529→   529→    def generate_pcr_data(self, underlying: str, expiry: str, count: int = 100) -> dict:
+   530→   530→        """Generate PCR time series data."""
+   531→   531→        config = UNDERLYINGS.get(underlying, NIFTY_CONFIG)
+   532→   532→        spot = self.get_spot(underlying)
+   533→   533→        now_ms = int(time.time() * 1000)
+   534→   534→
+   535→   535→        data = []
+   536→   536→        current_spot = self._open_spot.get(underlying, spot)
+   537→   537→        prev_pcr = random.uniform(0.8, 1.5)
+   538→   538→
+   539→   539→        for i in range(count):
+   540→   540→            ts = now_ms - (count - i) * 60000
+   541→   541→
+   542→   542→            # Spot drifts realistically
+   543→   543→            current_spot += random.gauss(0, config["volatility_daily"] * current_spot / math.sqrt(375))
+   544→   544→
+   545→   545→            # PCR fluctuates
+   546→   546→            pcr = prev_pcr + random.gauss(0, 0.02)
+   547→   547→            pcr = max(0.3, min(3.0, pcr))
+   548→   548→            change_pcr = round(pcr - prev_pcr, 4)
+   549→   549→
+   550→   550→            data.append({
+   551→   551→                "timestamp": ts,
+   552→   552→                "spot": round(current_spot, 2),
+   553→   553→                "pcr": round(pcr, 4),
+   554→   554→                "change_pcr": change_pcr,
+   555→   555→            })
+   556→   556→            prev_pcr = pcr
+   557→   557→
+   558→   558→        current_pcr = data[-1]["pcr"] if data else 1.0
+   559→   559→        current_change_pcr = data[-1]["change_pcr"] if data else 0.0
+   560→   560→
+   561→   561→        return {
+   562→   562→            "underlying": underlying,
+   563→   563→            "expiry": expiry,
+   564→   564→            "data": data,
+   565→   565→            "current_pcr": round(current_pcr, 4),
+   566→   566→            "current_change_pcr": round(current_change_pcr, 4),
+   567→   567→        }
+   568→   568→
+   569→   569→    def generate_candles(
+   570→   570→        self,
+   571→   571→        instrument_key: str,
+   572→   572→        timeframe: str,
+   573→   573→        count: int = 200,
+   574→   574→    ) -> list[dict]:
+   575→   575→        """Generate candlestick data for an instrument."""
+   576→   576→        # Parse instrument key
+   577→   577→        parts = instrument_key.split("|")
+   578→   578→        if len(parts) < 2:
+   579→   579→            return []
+   580→   580→
+   581→   581→        # Determine timeframe in seconds
+   582→   582→        tf_seconds = {
+   583→   583→            "1m": 60, "3m": 180, "5m": 300, "15m": 900, "1h": 3600,
+   584→   584→        }.get(timeframe, 60)
+   585→   585→
+   586→   586→        now_ms = int(time.time() * 1000)
+   587→   587→        candles = []
+   588→   588→
+   589→   589→        # Determine base price from instrument key
+   590→   590→        base_price = self._price_from_instrument_key(instrument_key)
+   591→   591→        current_price = base_price
+   592→   592→
+   593→   593→        vol_per_candle = 0.001 * math.sqrt(tf_seconds / 60)  # Volatility scales with sqrt(time)
+   594→   594→
+   595→   595→        for i in range(count):
+   596→   596→            ts = now_ms - (count - i) * tf_seconds * 1000
+   597→   597→
+   598→   598→            open_price = current_price
+   599→   599→            # Random price movement
+   600→   600→            change = random.gauss(0, vol_per_candle * current_price)
+   601→   601→            close_price = round(open_price + change, 2)
+   602→   602→
+   603→   603→            # High and low
+   604→   604→            high = round(max(open_price, close_price) + abs(random.gauss(0, vol_per_candle * current_price * 0.5)), 2)
+   605→   605→            low = round(min(open_price, close_price) - abs(random.gauss(0, vol_per_candle * current_price * 0.5)), 2)
+   606→   606→
+   607→   607→            # Ensure low doesn't go below minimum
+   608→   608→            low = max(0.05, low)
+   609→   609→
+   610→   610→            volume = random.randint(100, 50000)
+   611→   611→            oi = random.randint(10000, 500000)
+   612→   612→
+   613→   613→            candles.append({
+   614→   614→                "timestamp": ts,
+   615→   615→                "open": round(open_price, 2),
+   616→   616→                "high": high,
+   617→   617→                "low": low,
+   618→   618→                "close": round(close_price, 2),
+   619→   619→                "volume": volume,
+   620→   620→                "oi": oi,
+   621→   621→            })
+   622→   622→
+   623→   623→            current_price = close_price
+   624→   624→
+   625→   625→        return candles
+   626→   626→
+   627→   627→    def get_7strike_matrix(self, underlying: str, expiry: str) -> dict:
+   628→   628→        """
+   629→   629→        Generate 7-Strike COI PCR Matrix data.
+   630→   630→        Implements the logic from the 7-Strike System document.
+   631→   631→        """
+   632→   632→        config = UNDERLYINGS.get(underlying, NIFTY_CONFIG)
+   633→   633→        spot = self.get_spot(underlying)
+   634→   634→        atm = _atm_strike(spot, config["strike_step"])
+   635→   635→        step = config["strike_step"]
+   636→   636→
+   637→   637→        now_ms = int(time.time() * 1000)
+   638→   638→
+   639→   639→        # 7-strike window centered around ATM: ATM-3, ATM-2, ATM-1, ATM, ATM+1, ATM+2, ATM+3
+   640→   640→        window_strikes = [atm + i * step for i in range(-3, 4)]
+   641→   641→
+   642→   642→        rows = []
+   643→   643→        ce_coi_sum = 0
+   644→   644→        pe_coi_sum = 0
+   645→   645→
+   646→   646→        for strike in window_strikes:
+   647→   647→            ce_key = self._make_instrument_key(underlying, expiry, strike, "CE")
+   648→   648→            pe_key = self._make_instrument_key(underlying, expiry, strike, "PE")
+   649→   649→
+   650→   650→            ce_oi, ce_change_oi = self._simulate_oi(underlying, ce_key, strike, atm, "CE", step)
+   651→   651→            pe_oi, pe_change_oi = self._simulate_oi(underlying, pe_key, strike, atm, "PE", step)
+   652→   652→
+   653→   653→            ce_coi_sum += ce_change_oi
+   654→   654→            pe_coi_sum += pe_change_oi
+   655→   655→
+   656→   656→            rows.append({
+   657→   657→                "strike": strike,
+   658→   658→                "ce_coi": ce_change_oi,
+   659→   659→                "pe_coi": pe_change_oi,
+   660→   660→                "ce_oi": ce_oi,
+   661→   661→                "pe_oi": pe_oi,
+   662→   662→            })
+   663→   663→
+   664→   664→        # COI PCR = Sum(PE COI) / Sum(CE COI)
+   665→   665→        coi_pcr = round(pe_coi_sum / ce_coi_sum, 4) if ce_coi_sum != 0 else 0.0
+   666→   666→
+   667→   667→        # Determine state (simplified - no actual shift tracking in simulator)
+   668→   668→        state = "STABLE"
+   669→   669→
+   670→   670→        return {
+   671→   671→            "underlying": underlying,
+   672→   672→            "expiry": expiry,
+   673→   673→            "spot_price": spot,
+   674→   674→            "atm_strike": atm,
+   675→   675→            "strike_step": step,
+   676→   676→            "window_strikes": window_strikes,
+   677→   677→            "rows": rows,
+   678→   678→            "ce_coi_sum": ce_coi_sum,
+   679→   679→            "pe_coi_sum": pe_coi_sum,
+   680→   680→            "coi_pcr": coi_pcr,
+   681→   681→            "state": state,
+   682→   682→            "last_shift_time": None,
+   683→   683→            "stabilization_end_time": None,
+   684→   684→        }
+   685→   685→
+   686→   686→    def get_7strike_signals(self, underlying: str, expiry: str) -> dict:
+   687→   687→        """
+   688→   688→        Generate 7-Strike system signals based on the matrix data.
+   689→   689→        Implements signal logic from the 7-Strike System document.
+   690→   690→        """
+   691→   691→        matrix = self.get_7strike_matrix(underlying, expiry)
+   692→   692→        coi_pcr = matrix["coi_pcr"]
+   693→   693→        spot = matrix["spot_price"]
+   694→   694→
+   695→   695→        now_ms = int(time.time() * 1000)
+   696→   696→        signals = []
+   697→   697→
+   698→   698→        # Determine gate condition based on COI PCR
+   699→   699→        # COI PCR > 1.2 = Bullish (heavy PE writing = support)
+   700→   700→        # COI PCR < 0.8 = Bearish (heavy CE writing = resistance)
+   701→   701→        # Between 0.8 and 1.2 = Neutral
+   702→   702→
+   703→   703→        gate_condition = "NONE"
+   704→   704→        current_signal = None
+   705→   705→
+   706→   706→        if coi_pcr > 1.5:
+   707→   707→            gate_condition = "LONG"
+   708→   708→            confidence = min(1.0, (coi_pcr - 1.0) / 1.0)
+   709→   709→            current_signal = {
+   710→   710→                "signal_type": "LONG",
+   711→   711→                "confidence": round(confidence, 2),
+   712→   712→                "reason": f"Strong bullish: COI PCR at {coi_pcr:.2f} indicates heavy Put writing support. Institutional buyers defending {int(matrix['atm_strike'])} level.",
+   713→   713→                "timestamp": now_ms,
+   714→   714→                "spot_price": spot,
+   715→   715→                "coi_pcr": coi_pcr,
+   716→   716→                "volume_percent": round(random.uniform(1.0, 3.5), 2),
+   717→   717→                "gate_condition": "LONG",
+   718→   718→                "pain_index": round(random.uniform(0.5, 2.0), 2),
+   719→   719→            }
+   720→   720→        elif coi_pcr < 0.6:
+   721→   721→            gate_condition = "SHORT"
+   722→   722→            confidence = min(1.0, (1.0 - coi_pcr) / 0.5)
+   723→   723→            current_signal = {
+   724→   724→                "signal_type": "SHORT",
+   725→   725→                "confidence": round(confidence, 2),
+   726→   726→                "reason": f"Strong bearish: COI PCR at {coi_pcr:.2f} indicates heavy Call writing resistance. Institutional sellers defending {int(matrix['atm_strike'])} level.",
+   727→   727→                "timestamp": now_ms,
+   728→   728→                "spot_price": spot,
+   729→   729→                "coi_pcr": coi_pcr,
+   730→   730→                "volume_percent": round(random.uniform(1.0, 3.5), 2),
+   731→   731→                "gate_condition": "SHORT",
+   732→   732→                "pain_index": round(random.uniform(0.5, 2.0), 2),
+   733→   733→            }
+   734→   734→        elif coi_pcr > 1.2:
+   735→   735→            gate_condition = "LONG"
+   736→   736→            signals.append({
+   737→   737→                "signal_type": "LONG",
+   738→   738→                "confidence": round((coi_pcr - 1.0) / 1.0, 2),
+   739→   739→                "reason": f"Moderate bullish bias: COI PCR at {coi_pcr:.2f}. Put writers active, watching for trigger.",
+   740→   740→                "timestamp": now_ms - 60000,
+   741→   741→                "spot_price": spot,
+   742→   742→                "coi_pcr": coi_pcr,
+   743→   743→                "volume_percent": None,
+   744→   744→                "gate_condition": "LONG",
+   745→   745→                "pain_index": None,
+   746→   746→            })
+   747→   747→        elif coi_pcr < 0.8:
+   748→   748→            gate_condition = "SHORT"
+   749→   749→            signals.append({
+   750→   750→                "signal_type": "SHORT",
+   751→   751→                "confidence": round((1.0 - coi_pcr) / 0.5, 2),
+   752→   752→                "reason": f"Moderate bearish bias: COI PCR at {coi_pcr:.2f}. Call writers active, watching for trigger.",
+   753→   753→                "timestamp": now_ms - 60000,
+   754→   754→                "spot_price": spot,
+   755→   755→                "coi_pcr": coi_pcr,
+   756→   756→                "volume_percent": None,
+   757→   757→                "gate_condition": "SHORT",
+   758→   758→                "pain_index": None,
+   759→   759→            })
+   760→   760→
+   761→   761→        # Add some historical signals for context
+   762→   762→        for i in range(3):
+   763→   763→            sig_ts = now_ms - (i + 1) * 300000  # 5 min apart
+   764→   764→            sig_pcr = coi_pcr + random.gauss(0, 0.1)
+   765→   765→            sig_spot = spot + random.gauss(0, 10)
+   766→   766→            if sig_pcr > 1.2:
+   767→   767→                signals.append({
+   768→   768→                    "signal_type": "LONG",
+   769→   769→                    "confidence": round(min(1.0, (sig_pcr - 1.0) / 1.0), 2),
+   770→   770→                    "reason": f"COI PCR at {sig_pcr:.2f} - Put writing support detected",
+   771→   771→                    "timestamp": sig_ts,
+   772→   772→                    "spot_price": round(sig_spot, 2),
+   773→   773→                    "coi_pcr": round(sig_pcr, 4),
+   774→   774→                    "volume_percent": round(random.uniform(0.5, 2.0), 2),
+   775→   775→                    "gate_condition": "LONG",
+   776→   776→                    "pain_index": round(random.uniform(0.0, 1.5), 2),
+   777→   777→                })
+   778→   778→            elif sig_pcr < 0.8:
+   779→   779→                signals.append({
+   780→   780→                    "signal_type": "SHORT",
+   781→   781→                    "confidence": round(min(1.0, (1.0 - sig_pcr) / 0.5), 2),
+   782→   782→                    "reason": f"COI PCR at {sig_pcr:.2f} - Call writing resistance detected",
+   783→   783→                    "timestamp": sig_ts,
+   784→   784→                    "spot_price": round(sig_spot, 2),
+   785→   785→                    "coi_pcr": round(sig_pcr, 4),
+   786→   786→                    "volume_percent": round(random.uniform(0.5, 2.0), 2),
+   787→   787→                    "gate_condition": "SHORT",
+   788→   788→                    "pain_index": round(random.uniform(0.0, 1.5), 2),
+   789→   789→                })
+   790→   790→            else:
+   791→   791→                signals.append({
+   792→   792→                    "signal_type": "NEUTRAL",
+   793→   793→                    "confidence": 0.0,
+   794→   794→                    "reason": f"COI PCR at {sig_pcr:.2f} - No directional bias",
+   795→   795→                    "timestamp": sig_ts,
+   796→   796→                    "spot_price": round(sig_spot, 2),
+   797→   797→                    "coi_pcr": round(sig_pcr, 4),
+   798→   798→                    "volume_percent": round(random.uniform(0.5, 1.5), 2),
+   799→   799→                    "gate_condition": "NONE",
+   800→   800→                    "pain_index": None,
+   801→   801→                })
+   802→   802→
+   803→   803→        # Sort signals by timestamp
+   804→   804→        signals.sort(key=lambda s: s["timestamp"], reverse=True)
+   805→   805→
+   806→   806→        # Determine state
+   807→   807→        if current_signal:
+   808→   808→            state = "ACTIVE"
+   809→   809→        elif gate_condition != "NONE":
+   810→   810→            state = "ZONE_WATCH"
+   811→   811→        else:
+   812→   812→            state = "IDLE"
+   813→   813→
+   814→   814→        return {
+   815→   815→            "underlying": underlying,
+   816→   816→            "expiry": expiry,
+   817→   817→            "signals": signals,
+   818→   818→            "current_signal": current_signal,
+   819→   819→            "gate_condition": gate_condition,
+   820→   820→            "state": state,
+   821→   821→        }
+   822→   822→
+   823→   823→    # ---------- Private helpers ----------
+   824→   824→
+   825→   825→    def _simulate_oi(
+   826→   826→        self,
+   827→   827→        underlying: str,
+   828→   828→        instrument_key: str,
+   829→   829→        strike: float,
+   830→   830→        atm: float,
+   831→   831→        option_type: str,
+   832→   832→        step: int,
+   833→   833→    ) -> tuple[int, int]:
+   834→   834→        """
+   835→   835→        Simulate OI and Change in OI for an option strike.
+   836→   836→        Returns (oi, change_oi).
+   837→   837→        """
+   838→   838→        if instrument_key not in self._oi_state:
+   839→   839→            # Initialize OI based on distance from ATM
+   840→   840→            dist_from_atm = abs(strike - atm) / step
+   841→   841→
+   842→   842→            # OI is highest near ATM for PE (support) and varies for CE
+   843→   843→            if option_type == "PE":
+   844→   844→                # PE OI is highest at ATM and below (support levels)
+   845→   845→                base_oi = max(10000, int(300000 * math.exp(-dist_from_atm * 0.3)))
+   846→   846→            else:
+   847→   847→                # CE OI is highest at ATM and above (resistance levels)
+   848→   848→                base_oi = max(10000, int(250000 * math.exp(-dist_from_atm * 0.3)))
+   849→   849→
+   850→   850→            # Add randomness
+   851→   851→            open_oi = max(5000, base_oi + random.randint(-base_oi // 4, base_oi // 4))
+   852→   852→            current_oi = open_oi
+   853→   853→
+   854→   854→            self._oi_state[instrument_key] = {
+   855→   855→                "open_oi": open_oi,
+   856→   856→                "current_oi": current_oi,
+   857→   857→            }
+   858→   858→
+   859→   859→        state = self._oi_state[instrument_key]
+   860→   860→
+   861→   861→        # Update OI with small changes
+   862→   862→        oi_change = random.randint(-2000, 3000)
+   863→   863→
+   864→   864→        # Bias: PE OI tends to build up (support), CE OI also builds (resistance)
+   865→   865→        if option_type == "PE":
+   866→   866→            oi_change = int(oi_change * 1.2)  # Slight bullish bias
+   867→   867→
+   868→   868→        state["current_oi"] = max(1000, state["current_oi"] + oi_change)
+   869→   869→        change_oi = state["current_oi"] - state["open_oi"]
+   870→   870→
+   871→   871→        return state["current_oi"], change_oi
+   872→   872→
+   873→   873→    def _make_instrument_key(self, underlying: str, expiry: str, strike: float, opt_type: str) -> str:
+   874→   874→        """Create an instrument key in Upstox format: NSE_FO|NIFTY25JUN23500CE"""
+   875→   875→        expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
+   876→   876→        expiry_short = expiry_dt.strftime("%d%b").upper()
+   877→   877→        # Upstox style: NSE_FO|NIFTY25JUN23500CE
+   878→   878→        return f"NSE_FO|{underlying}{expiry_short}{int(strike)}{opt_type}"
+   879→   879→
+   880→   880→    def _make_trading_symbol(self, underlying: str, expiry: str, strike: float, opt_type: str) -> str:
+   881→   881→        """Create a trading symbol: NIFTY25JUN23500CE"""
+   882→   882→        expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
+   883→   883→        expiry_short = expiry_dt.strftime("%d%b").upper()
+   884→   884→        return f"{underlying}{expiry_short}{int(strike)}{opt_type}"
+   885→   885→
+   886→   886→    def _price_from_instrument_key(self, instrument_key: str) -> float:
+   887→   887→        """Estimate a base price from an instrument key."""
+   888→   888→        config = NIFTY_CONFIG
+   889→   889→        spot = self.get_spot("NIFTY")
+   890→   890→
+   891→   891→        # Try to extract strike and option type
+   892→   892→        try:
+   893→   893→            # Format: NSE_FO|NIFTY25JUN23500CE
+   894→   894→            parts = instrument_key.split("|")
+   895→   895→            symbol = parts[1] if len(parts) > 1 else parts[0]
+   896→   896→
+   897→   897→            # Extract the numeric part and option type
+   898→   898→            opt_type = "CE" if symbol.endswith("CE") else "PE"
+   899→   899→            # Remove prefix and suffix to get strike
+   900→   900→            numeric_part = symbol
+   901→   901→            for prefix in ["NIFTY", "BANKNIFTY"]:
+   902→   902→                if numeric_part.startswith(prefix):
+   903→   903→                    numeric_part = numeric_part[len(prefix):]
+   904→   904→                    break
+   905→   905→            numeric_part = numeric_part.rstrip("CE").rstrip("PE")
+   906→   906→            # Remove date part (first 5 chars like 25JUN)
+   907→   907→            if len(numeric_part) > 5:
+   908→   908→                strike_str = numeric_part[5:]
+   909→   909→                strike = float(strike_str)
+   910→   910→            else:
+   911→   911→                strike = spot
+   912→   912→
+   913→   913→            # Calculate rough premium
+   914→   914→            diff = spot - strike
+   915→   915→            if opt_type == "CE":
+   916→   916→                price = max(0.05, diff) if diff > 0 else max(0.05, 50 * math.exp(-abs(diff) / 200))
+   917→   917→            else:
+   918→   918→                price = max(0.05, -diff) if diff < 0 else max(0.05, 50 * math.exp(-abs(diff) / 200))
+   919→   919→            return round(price, 2)
+   920→   920→        except Exception:
+   921→   921→            return round(spot * 0.02, 2)  # Default ~2% of spot
+   922→   922→
+   923→   923→
+   924→   924→# Global singleton
+   925→   925→_simulator: Optional[MarketDataSimulator] = None
+   926→   926→
+   927→   927→
+   928→   928→def get_simulator() -> MarketDataSimulator:
+   929→   929→    """Get or create the global simulator instance."""
+   930→   930→    global _simulator
+   931→   931→    if _simulator is None:
+   932→   932→        _simulator = MarketDataSimulator()
+   933→   933→        print("[Simulator] Initialized with realistic market data")
+   934→   934→    return _simulator
+   935→   935→

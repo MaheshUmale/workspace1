@@ -1,0 +1,1022 @@
+     1→'use client';
+     2→
+     3→import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+     4→import { createChart, LineSeries, type IChartApi, type ISeriesApi } from 'lightweight-charts';
+     5→import { useTradingStore } from '@/store/trading-store';
+     6→import { fetchAPI, formatNumber, DARK_THEME } from '@/lib/chart-utils';
+     7→import {
+     8→  ArrowUp,
+     9→  ArrowDown,
+    10→  Zap,
+    11→  Activity,
+    12→  TrendingUp,
+    13→  TrendingDown,
+    14→  Minus,
+    15→  RefreshCw,
+    16→  Clock,
+    17→  ShieldAlert,
+    18→  Volume2,
+    19→  Crosshair,
+    20→  X,
+    21→  CheckCircle2,
+    22→  AlertTriangle,
+    23→  Target,
+    24→  Flag,
+    25→} from 'lucide-react';
+    26→import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+    27→import { Switch } from '@/components/ui/switch';
+    28→import { Badge } from '@/components/ui/badge';
+    29→import { motion, AnimatePresence } from 'framer-motion';
+    30→
+    31→// ============ Types ============
+    32→
+    33→interface SevenStrikeRow {
+    34→  strike: number;
+    35→  ce_coi: number;
+    36→  pe_coi: number;
+    37→  ce_oi: number;
+    38→  pe_oi: number;
+    39→}
+    40→
+    41→interface SevenStrikeMatrix {
+    42→  underlying: string;
+    43→  expiry: string;
+    44→  spot_price: number;
+    45→  atm_strike: number;
+    46→  strike_step: number;
+    47→  window_strikes: number[];
+    48→  rows: SevenStrikeRow[];
+    49→  ce_coi_sum: number;
+    50→  pe_coi_sum: number;
+    51→  coi_pcr: number;
+    52→  state: string;
+    53→}
+    54→
+    55→interface Signal {
+    56→  signal_type: string;
+    57→  confidence: number;
+    58→  reason: string;
+    59→  timestamp: number;
+    60→  spot_price: number;
+    61→  coi_pcr: number;
+    62→  volume_percent: number | null;
+    63→  gate_condition: string | null;
+    64→  pain_index: number | null;
+    65→}
+    66→
+    67→interface SevenStrikeSignals {
+    68→  underlying: string;
+    69→  expiry: string;
+    70→  signals: Signal[];
+    71→  current_signal: Signal | null;
+    72→  gate_condition: string;
+    73→  state: string;
+    74→}
+    75→
+    76→interface COIPCRPoint {
+    77→  timestamp: number;
+    78→  coi_pcr: number;
+    79→  spot: number;
+    80→  ce_coi_sum: number;
+    81→  pe_coi_sum: number;
+    82→  state: string;
+    83→  signal_type: string;
+    84→  confidence: number;
+    85→}
+    86→
+    87→interface TradeSuggestion {
+    88→  id: string;
+    89→  signal_type: 'LONG' | 'SHORT';
+    90→  entry_price: number;
+    91→  stop_loss: number;
+    92→  target: number;
+    93→  risk_reward: string;
+    94→  confidence: number;
+    95→  reason: string;
+    96→  timestamp: number;
+    97→  spot_price: number;
+    98→  coi_pcr: number;
+    99→  status: 'ACTIVE' | 'HIT_TARGET' | 'HIT_SL' | 'EXPIRED' | 'CANCELLED';
+   100→  option_suggestion: string;
+   101→  exit_reason: string | null;
+   102→}
+   103→
+   104→interface VolumeProxyPoint {
+   105→  timestamp: number;
+   106→  volume_percent: number;
+   107→  classification: 'NORMAL' | 'ELEVATED' | 'HIGH' | 'EXTREME';
+   108→  spot: number;
+   109→}
+   110→
+   111→interface TrapCluster {
+   112→  id: string;
+   113→  price_high: number;
+   114→  price_low: number;
+   115→  timestamp_start: number;
+   116→  volume_trapped: number;
+   117→  direction: 'BULLISH_TRAP' | 'BEARISH_TRAP';
+   118→  pain_index: number;
+   119→  active: boolean;
+   120→  triggered: boolean;
+   121→}
+   122→
+   123→interface SevenStrikeHistory {
+   124→  underlying: string;
+   125→  expiry: string;
+   126→  coi_pcr_series: COIPCRPoint[];
+   127→  volume_proxy_series: VolumeProxyPoint[];
+   128→  trap_clusters: TrapCluster[];
+   129→  signals: Signal[];
+   130→  trade_suggestions: TradeSuggestion[];
+   131→}
+   132→
+   133→// ============ Helpers ============
+   134→
+   135→function formatTimeHHMMSS(timestamp: number): string {
+   136→  return new Date(timestamp).toLocaleTimeString('en-IN', {
+   137→    hour: '2-digit',
+   138→    minute: '2-digit',
+   139→    second: '2-digit',
+   140→    hour12: false,
+   141→  });
+   142→}
+   143→
+   144→function formatTimeShort(timestamp: number): string {
+   145→  return new Date(timestamp).toLocaleTimeString('en-IN', {
+   146→    hour: '2-digit',
+   147→    minute: '2-digit',
+   148→    hour12: false,
+   149→  });
+   150→}
+   151→
+   152→function timeSince(timestamp: number): string {
+   153→  const diff = Date.now() - timestamp;
+   154→  const mins = Math.floor(diff / 60000);
+   155→  if (mins < 1) return 'just now';
+   156→  if (mins < 60) return `${mins}m ago`;
+   157→  const hrs = Math.floor(mins / 60);
+   158→  return `${hrs}h ${mins % 60}m ago`;
+   159→}
+   160→
+   161→function getStateStyle(state: string) {
+   162→  switch (state) {
+   163→    case 'ACTIVE':
+   164→      return { bg: 'bg-green-500/15 border-green-500/40', text: 'text-green-400', pulse: true };
+   165→    case 'ZONE_WATCH':
+   166→      return { bg: 'bg-yellow-500/15 border-yellow-500/40', text: 'text-yellow-400', pulse: false };
+   167→    case 'STABILIZING':
+   168→      return { bg: 'bg-orange-500/15 border-orange-500/40', text: 'text-orange-400', pulse: false };
+   169→    default:
+   170→      return { bg: 'bg-gray-500/15 border-gray-500/40', text: 'text-gray-400', pulse: false };
+   171→  }
+   172→}
+   173→
+   174→function getSignalStyle(type: string) {
+   175→  switch (type) {
+   176→    case 'LONG':
+   177→      return { text: 'text-green-400', bg: 'bg-green-500/15', icon: TrendingUp };
+   178→    case 'SHORT':
+   179→      return { text: 'text-red-400', bg: 'bg-red-500/15', icon: TrendingDown };
+   180→    default:
+   181→      return { text: 'text-gray-400', bg: 'bg-gray-500/15', icon: Minus };
+   182→  }
+   183→}
+   184→
+   185→function getConfidenceColor(confidence: number): string {
+   186→  if (confidence > 0.7) return '#22c55e';
+   187→  if (confidence > 0.4) return '#eab308';
+   188→  return '#ef4444';
+   189→}
+   190→
+   191→function getVolumeClassification(cls: string) {
+   192→  switch (cls) {
+   193→    case 'EXTREME':
+   194→      return { bg: 'bg-red-500/20 border-red-500/40', text: 'text-red-400', badge: 'bg-red-600' };
+   195→    case 'HIGH':
+   196→      return { bg: 'bg-orange-500/20 border-orange-500/40', text: 'text-orange-400', badge: 'bg-orange-600' };
+   197→    case 'ELEVATED':
+   198→      return { bg: 'bg-yellow-500/20 border-yellow-500/40', text: 'text-yellow-400', badge: 'bg-yellow-600' };
+   199→    default:
+   200→      return { bg: 'bg-gray-500/15 border-gray-500/40', text: 'text-gray-400', badge: 'bg-gray-600' };
+   201→  }
+   202→}
+   203→
+   204→// ============ Circular Progress Component ============
+   205→
+   206→function CircularProgress({ value, size = 56, strokeWidth = 4, color }: { value: number; size?: number; strokeWidth?: number; color: string }) {
+   207→  const radius = (size - strokeWidth) / 2;
+   208→  const circumference = 2 * Math.PI * radius;
+   209→  const offset = circumference - (value / 100) * circumference;
+   210→
+   211→  return (
+   212→    <svg width={size} height={size} className="transform -rotate-90">
+   213→      <circle cx={size / 2} cy={size / 2} r={radius} fill="none" stroke="#1f2937" strokeWidth={strokeWidth} />
+   214→      <circle
+   215→        cx={size / 2}
+   216→        cy={size / 2}
+   217→        r={radius}
+   218→        fill="none"
+   219→        stroke={color}
+   220→        strokeWidth={strokeWidth}
+   221→        strokeDasharray={circumference}
+   222→        strokeDashoffset={offset}
+   223→        strokeLinecap="round"
+   224→        className="transition-all duration-700"
+   225→      />
+   226→    </svg>
+   227→  );
+   228→}
+   229→
+   230→// ============ PCR Bar Component ============
+   231→
+   232→function PCRBar({ pcr }: { pcr: number }) {
+   233→  const clampedPcr = Math.min(Math.max(pcr, 0), 2);
+   234→  const percent = (clampedPcr / 2) * 100;
+   235→
+   236→  return (
+   237→    <div className="relative h-2 w-full rounded-full bg-[#1f2937] overflow-hidden mt-1.5">
+   238→      {/* Red zone: 0-0.8 */}
+   239→      <div className="absolute left-0 top-0 h-full bg-red-500/30" style={{ width: '40%' }} />
+   240→      {/* Neutral zone: 0.8-1.2 */}
+   241→      <div className="absolute top-0 h-full bg-yellow-500/20" style={{ left: '40%', width: '20%' }} />
+   242→      {/* Green zone: 1.2-2.0 */}
+   243→      <div className="absolute top-0 h-full bg-green-500/30" style={{ left: '60%', width: '40%' }} />
+   244→      {/* Indicator */}
+   245→      <div
+   246→        className="absolute top-0 h-full w-0.5 bg-white shadow-lg shadow-white/50 transition-all duration-500"
+   247→        style={{ left: `${percent}%` }}
+   248→      />
+   249→      {/* Reference lines */}
+   250→      <div className="absolute top-0 h-full w-px bg-gray-500/40" style={{ left: '40%' }} />
+   251→      <div className="absolute top-0 h-full w-px bg-gray-500/40" style={{ left: '60%' }} />
+   252→    </div>
+   253→  );
+   254→}
+   255→
+   256→// ============ Main Component ============
+   257→
+   258→export default function SevenStrikePage() {
+   259→  const { underlying, expiry, setUnderlying, setExpiry, expiries, setExpiries } = useTradingStore();
+   260→
+   261→  // Data state
+   262→  const [matrix, setMatrix] = useState<SevenStrikeMatrix | null>(null);
+   263→  const [signals, setSignals] = useState<SevenStrikeSignals | null>(null);
+   264→  const [history, setHistory] = useState<SevenStrikeHistory | null>(null);
+   265→  const [trades, setTrades] = useState<TradeSuggestion[]>([]);
+   266→  const [loading, setLoading] = useState(true);
+   267→  const [autoRefresh, setAutoRefresh] = useState(true);
+   268→  const [lastUpdate, setLastUpdate] = useState<number>(Date.now());
+   269→  const [isLive, setIsLive] = useState(false);
+   270→
+   271→  // Chart refs
+   272→  const chartContainerRef = useRef<HTMLDivElement>(null);
+   273→  const chartRef = useRef<IChartApi | null>(null);
+   274→  const pcrSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
+   275→  const spotSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
+   276→
+   277→  // Signal log ref for auto-scroll
+   278→  const signalLogRef = useRef<HTMLDivElement>(null);
+   279→
+   280→  // Dismissed trades
+   281→  const [dismissedTrades, setDismissedTrades] = useState<Set<string>>(new Set());
+   282→
+   283→  // ============ Fetch expiries ============
+   284→  useEffect(() => {
+   285→    (async () => {
+   286→      try {
+   287→        const data = await fetchAPI<{ underlying: string; expiries: Array<{ expiry_date: string }> }>(
+   288→          '/api/instruments/expiries',
+   289→          { underlying }
+   290→        );
+   291→        const exps = data.expiries.map((e) => e.expiry_date);
+   292→        setExpiries(exps);
+   293→        if (exs.length > 0 && !expiry) setExpiry(exps[0]);
+   294→      } catch (err) {
+   295→        console.error('Failed to fetch expiries:', err);
+   296→      }
+   297→    })();
+   298→  }, [underlying, setExpiries, setExpiry, expiry]);
+   299→
+   300→  // ============ Fetch all data ============
+   301→  const fetchData = useCallback(async () => {
+   302→    if (!expiry) return;
+   303→    try {
+   304→      const [matrixData, signalsData, historyData, tradesData] = await Promise.all([
+   305→        fetchAPI<SevenStrikeMatrix>('/api/7strike/matrix', { underlying, expiry }),
+   306→        fetchAPI<SevenStrikeSignals>('/api/7strike/signals', { underlying, expiry }),
+   307→        fetchAPI<SevenStrikeHistory>('/api/7strike/history', { underlying, expiry }),
+   308→        fetchAPI<TradeSuggestion[]>('/api/7strike/trades', { underlying, expiry }),
+   309→      ]);
+   310→      setMatrix(matrixData);
+   311→      setSignals(signalsData);
+   312→      setHistory(historyData);
+   313→      setTrades(tradesData);
+   314→      setLastUpdate(Date.now());
+   315→      setIsLive(true);
+   316→    } catch (err) {
+   317→      console.error('Failed to fetch 7-Strike data:', err);
+   318→      setIsLive(false);
+   319→    } finally {
+   320→      setLoading(false);
+   321→    }
+   322→  }, [underlying, expiry]);
+   323→
+   324→  // Initial fetch
+   325→  useEffect(() => {
+   326→    fetchData();
+   327→  }, [fetchData]);
+   328→
+   329→  // Auto-refresh (3s polling)
+   330→  useEffect(() => {
+   331→    if (!autoRefresh || !expiry) return;
+   332→    const interval = setInterval(() => {
+   333→      fetchData();
+   334→    }, 3000);
+   335→    return () => clearInterval(interval);
+   336→  }, [autoRefresh, expiry, fetchData]);
+   337→
+   338→  // ============ Create lightweight-charts instance ============
+   339→  useEffect(() => {
+   340→    if (!chartContainerRef.current) return;
+   341→
+   342→    const chart = createChart(chartContainerRef.current, {
+   343→      ...DARK_THEME,
+   344→      width: chartContainerRef.current.clientWidth,
+   345→      height: chartContainerRef.current.clientHeight,
+   346→      rightPriceScale: {
+   347→        ...DARK_THEME.rightPriceScale,
+   348→        scaleMargins: { top: 0.1, bottom: 0.2 },
+   349→      },
+   350→      leftPriceScale: {
+   351→        visible: true,
+   352→        borderColor: '#1e222d',
+   353→        textColor: '#9ca3af',
+   354→        scaleMargins: { top: 0.1, bottom: 0.2 },
+   355→      },
+   356→    });
+   357→
+   358→    const pcrSeries = chart.addSeries(LineSeries, {
+   359→      color: '#eab308',
+   360→      lineWidth: 2,
+   361→      priceScaleId: 'left',
+   362→      title: 'COI PCR',
+   363→    });
+   364→
+   365→    const spotSeries = chart.addSeries(LineSeries, {
+   366→      color: '#3b82f6',
+   367→      lineWidth: 1,
+   368→      priceScaleId: 'right',
+   369→      lastValueVisible: false,
+   370→      priceLineVisible: false,
+   371→      title: 'Spot',
+   372→    });
+   373→
+   374→    chartRef.current = chart;
+   375→    pcrSeriesRef.current = pcrSeries;
+   376→    spotSeriesRef.current = spotSeries;
+   377→
+   378→    const handleResize = () => {
+   379→      if (chartContainerRef.current) {
+   380→        chart.applyOptions({ width: chartContainerRef.current.clientWidth });
+   381→      }
+   382→    };
+   383→    window.addEventListener('resize', handleResize);
+   384→
+   385→    return () => {
+   386→      window.removeEventListener('resize', handleResize);
+   387→      chart.remove();
+   388→      chartRef.current = null;
+   389→      pcrSeriesRef.current = null;
+   390→      spotSeriesRef.current = null;
+   391→    };
+   392→  }, []);
+   393→
+   394→  // ============ Update chart data ============
+   395→  useEffect(() => {
+   396→    if (!pcrSeriesRef.current || !spotSeriesRef.current || !history) return;
+   397→
+   398→    const pcrData = history.coi_pcr_series.map((p) => ({
+   399→      time: Math.floor(p.timestamp / 1000) as unknown as import('lightweight-charts').UTCTimestamp,
+   400→      value: p.coi_pcr,
+   401→    }));
+   402→
+   403→    const spotData = history.coi_pcr_series.map((p) => ({
+   404→      time: Math.floor(p.timestamp / 1000) as unknown as import('lightweight-charts').UTCTimestamp,
+   405→      value: p.spot,
+   406→    }));
+   407→
+   408→    pcrSeriesRef.current.setData(pcrData);
+   409→    spotSeriesRef.current.setData(spotData);
+   410→
+   411→    // Add markers at signal change points
+   412→    const markers = history.coi_pcr_series
+   413→      .filter((p, i, arr) => i === 0 || p.signal_type !== arr[i - 1].signal_type)
+   414→      .map((p) => ({
+   415→        time: Math.floor(p.timestamp / 1000) as unknown as import('lightweight-charts').UTCTimestamp,
+   416→        position: (p.signal_type === 'LONG' ? 'belowBar' : p.signal_type === 'SHORT' ? 'aboveBar' : 'inBar') as 'belowBar' | 'aboveBar' | 'inBar',
+   417→        color: p.signal_type === 'LONG' ? '#22c55e' : p.signal_type === 'SHORT' ? '#ef4444' : '#9ca3af',
+   418→        shape: (p.signal_type === 'LONG' ? 'arrowUp' : p.signal_type === 'SHORT' ? 'arrowDown' : 'circle') as 'arrowUp' | 'arrowDown' | 'circle',
+   419→        text: p.signal_type,
+   420→      }));
+   421→
+   422→    pcrSeriesRef.current.setMarkers(markers);
+   423→
+   424→    // Add PCR reference lines using priceLineSources
+   425→    const createPriceLine = (price: number, color: string, title: string) => {
+   426→      return pcrSeriesRef.current?.createPriceLine({
+   427→        price,
+   428→        color,
+   429→        lineWidth: 1 as const,
+   430→        lineStyle: 2 as const,
+   431→        axisLabelVisible: true,
+   432→        title,
+   433→      });
+   434→    };
+   435→
+   436→    const lines = [
+   437→      createPriceLine(0.6, '#ef4444', 'Extreme Bear'),
+   438→      createPriceLine(0.8, '#f97316', 'Bearish'),
+   439→      createPriceLine(1.0, '#9ca3af', 'Neutral'),
+   440→      createPriceLine(1.2, '#22c55e', 'Bullish'),
+   441→      createPriceLine(1.5, '#15803d', 'Extreme Bull'),
+   442→    ];
+   443→
+   444→    // Fit content
+   445→    chartRef.current?.timeScale().fitContent();
+   446→
+   447→    return () => {
+   448→      lines.forEach((line) => {
+   449→        if (line) pcrSeriesRef.current?.removePriceLine(line);
+   450→      });
+   451→    };
+   452→  }, [history]);
+   453→
+   454→  // ============ Auto-scroll signal log ============
+   455→  useEffect(() => {
+   456→    if (signalLogRef.current) {
+   457→      signalLogRef.current.scrollTop = signalLogRef.current.scrollHeight;
+   458→    }
+   459→  }, [signals]);
+   460→
+   461→  // ============ Derived data ============
+   462→  const currentSignal = signals?.current_signal;
+   463→  const activeTrades = trades.filter((t) => t.status === 'ACTIVE' && !dismissedTrades.has(t.id));
+   464→  const currentVolume = history?.volume_proxy_series[history.volume_proxy_series.length - 1];
+   465→  const activeTrapClusters = history?.trap_clusters.filter((c) => c.active) || [];
+   466→
+   467→  const stateStyle = getStateStyle(signals?.state || 'IDLE');
+   468→  const signalStyle = getSignalStyle(currentSignal?.signal_type || 'NEUTRAL');
+   469→  const SignalIcon = signalStyle.icon;
+   470→
+   471→  const dismissTrade = (id: string) => {
+   472→    setDismissedTrades((prev) => new Set(prev).add(id));
+   473→  };
+   474→
+   475→  const pcrValue = matrix?.coi_pcr ?? 0;
+   476→
+   477→  // ============ Render ============
+   478→
+   479→  if (loading && !matrix) {
+   480→    return (
+   481→      <div className="min-h-screen bg-[#0a0e17] flex items-center justify-center">
+   482→        <div className="flex flex-col items-center gap-3">
+   483→          <Activity className="h-10 w-10 text-yellow-500 animate-spin" />
+   484→          <span className="text-gray-400 text-sm">Loading 7-Strike System...</span>
+   485→        </div>
+   486→      </div>
+   487→    );
+   488→  }
+   489→
+   490→  return (
+   491→    <div className="min-h-screen bg-[#0a0e17] text-gray-200">
+   492→      {/* ============ HEADER ============ */}
+   493→      <header className="sticky top-0 z-50 bg-[#0a0e17]/95 backdrop-blur-sm border-b border-[#1f2937]">
+   494→        <div className="flex items-center justify-between px-3 py-2 gap-2">
+   495→          {/* Left: Logo */}
+   496→          <div className="flex items-center gap-2 shrink-0">
+   497→            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-yellow-500 to-orange-600">
+   498→              <Zap className="h-4 w-4 text-white" />
+   499→            </div>
+   500→            <div className="hidden sm:block">
+   501→              <h1 className="text-sm font-bold text-white leading-tight">7-Strike System</h1>
+   502→              <p className="text-[9px] text-gray-500 leading-tight">COI PCR Signal Engine</p>
+   503→            </div>
+   504→          </div>
+   505→
+   506→          {/* Center: Underlying + Expiry */}
+   507→          <div className="flex items-center gap-2">
+   508→            {/* Underlying toggle */}
+   509→            <div className="flex items-center gap-0.5 rounded-md bg-[#111827] p-0.5 border border-[#1f2937]">
+   510→              {['NIFTY', 'BANKNIFTY'].map((sym) => (
+   511→                <button
+   512→                  key={sym}
+   513→                  onClick={() => setUnderlying(sym)}
+   514→                  className={`rounded px-2.5 py-1 text-[11px] font-semibold transition-all ${
+   515→                    underlying === sym
+   516→                      ? 'bg-yellow-600 text-white shadow-sm'
+   517→                      : 'text-gray-400 hover:text-gray-200'
+   518→                  }`}
+   519→                >
+   520→                  {sym === 'BANKNIFTY' ? 'BNF' : sym}
+   521→                </button>
+   522→              ))}
+   523→            </div>
+   524→
+   525→            {/* Expiry select */}
+   526→            <Select value={expiry} onValueChange={setExpiry}>
+   527→              <SelectTrigger className="h-7 w-[130px] text-[11px] bg-[#111827] border-[#1f2937] text-gray-300">
+   528→                <SelectValue placeholder="Expiry" />
+   529→              </SelectTrigger>
+   530→              <SelectContent className="bg-[#111827] border-[#1f2937]">
+   531→                {expiries.map((exp) => (
+   532→                  <SelectItem key={exp} value={exp} className="text-[11px] text-gray-300 focus:bg-[#1f2937] focus:text-white">
+   533→                    {new Date(exp).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' })}
+   534→                  </SelectItem>
+   535→                ))}
+   536→              </SelectContent>
+   537→            </Select>
+   538→          </div>
+   539→
+   540→          {/* Right: Controls */}
+   541→          <div className="flex items-center gap-3">
+   542→            {/* Mode indicator */}
+   543→            <div className="hidden md:flex items-center gap-1.5">
+   544→              <div className={`h-1.5 w-1.5 rounded-full ${isLive ? 'bg-green-500 animate-pulse' : 'bg-yellow-500'}`} />
+   545→              <span className="text-[10px] font-medium text-gray-400">
+   546→                {isLive ? 'LIVE' : 'SIMULATED'}
+   547→              </span>
+   548→            </div>
+   549→
+   550→            {/* Auto-refresh */}
+   551→            <div className="flex items-center gap-1.5">
+   552→              <span className="text-[10px] text-gray-500 hidden sm:inline">Auto</span>
+   553→              <Switch
+   554→                checked={autoRefresh}
+   555→                onCheckedChange={setAutoRefresh}
+   556→                className="data-[state=checked]:bg-yellow-600"
+   557→              />
+   558→            </div>
+   559→
+   560→            {/* Last update */}
+   561→            <div className="hidden lg:flex items-center gap-1 text-[10px] text-gray-500">
+   562→              <Clock className="h-3 w-3" />
+   563→              {formatTimeHHMMSS(lastUpdate)}
+   564→            </div>
+   565→          </div>
+   566→        </div>
+   567→      </header>
+   568→
+   569→      {/* ============ MAIN CONTENT ============ */}
+   570→      <div className="p-2 sm:p-3">
+   571→        {/* Top Section: Chart + Right Panel */}
+   572→        <div className="grid grid-cols-1 lg:grid-cols-5 gap-2 sm:gap-3 mb-2 sm:mb-3">
+   573→          {/* LEFT: COI PCR Chart (3/5) */}
+   574→          <div className="lg:col-span-3 rounded-lg border border-[#1f2937] bg-[#111827] overflow-hidden">
+   575→            <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#1f2937]">
+   576→              <div className="flex items-center gap-2">
+   577→                <Crosshair className="h-3.5 w-3.5 text-yellow-500" />
+   578→                <span className="text-xs font-semibold text-white">COI PCR Chart</span>
+   579→              </div>
+   580→              <div className="flex items-center gap-3 text-[10px]">
+   581→                <span className="flex items-center gap-1">
+   582→                  <span className="h-2 w-2 rounded-full bg-yellow-500" />
+   583→                  PCR
+   584→                </span>
+   585→                <span className="flex items-center gap-1">
+   586→                  <span className="h-2 w-2 rounded-full bg-blue-500" />
+   587→                  Spot
+   588→                </span>
+   589→              </div>
+   590→            </div>
+   591→            <div
+   592→              ref={chartContainerRef}
+   593→              className="w-full"
+   594→              style={{ height: '340px' }}
+   595→            />
+   596→          </div>
+   597→
+   598→          {/* RIGHT: Signal Dashboard + Trade Assistant + Signal Log (2/5) */}
+   599→          <div className="lg:col-span-2 flex flex-col gap-2 sm:gap-3">
+   600→            {/* Signal Dashboard - 4 cards */}
+   601→            <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-2 xl:grid-cols-4 gap-2">
+   602→              {/* State Card */}
+   603→              <motion.div
+   604→                className={`rounded-lg border p-2.5 ${stateStyle.bg}`}
+   605→                animate={stateStyle.pulse ? { opacity: [1, 0.7, 1] } : {}}
+   606→                transition={stateStyle.pulse ? { duration: 2, repeat: Infinity } : {}}
+   607→              >
+   608→                <div className="text-[9px] text-gray-500 uppercase tracking-wider mb-0.5">State</div>
+   609→                <div className={`text-base font-bold ${stateStyle.text}`}>
+   610→                  {signals?.state || 'IDLE'}
+   611→                </div>
+   612→              </motion.div>
+   613→
+   614→              {/* Signal Card */}
+   615→              <div className="rounded-lg border border-[#1f2937] bg-[#111827] p-2.5">
+   616→                <div className="text-[9px] text-gray-500 uppercase tracking-wider mb-0.5">Signal</div>
+   617→                <div className="flex items-center gap-1.5">
+   618→                  <SignalIcon className={`h-4 w-4 ${signalStyle.text}`} />
+   619→                  <span className={`text-base font-bold ${signalStyle.text}`}>
+   620→                    {currentSignal?.signal_type || 'NEUTRAL'}
+   621→                  </span>
+   622→                </div>
+   623→                {signals?.gate_condition && signals.gate_condition !== 'NONE' && (
+   624→                  <div className={`text-[9px] mt-0.5 font-medium ${signals.gate_condition === 'LONG' ? 'text-green-400' : signals.gate_condition === 'SHORT' ? 'text-red-400' : 'text-gray-500'}`}>
+   625→                    Gate: {signals.gate_condition}
+   626→                  </div>
+   627→                )}
+   628→              </div>
+   629→
+   630→              {/* COI PCR Card */}
+   631→              <div className="rounded-lg border border-[#1f2937] bg-[#111827] p-2.5">
+   632→                <div className="text-[9px] text-gray-500 uppercase tracking-wider mb-0.5">COI PCR</div>
+   633→                <div className="text-base font-bold text-white">
+   634→                  {matrix ? pcrValue.toFixed(3) : '-'}
+   635→                </div>
+   636→                <div className="text-[9px] text-gray-500">
+   637→                  CE: {formatNumber(matrix?.ce_coi_sum ?? 0)} | PE: {formatNumber(matrix?.pe_coi_sum ?? 0)}
+   638→                </div>
+   639→                {matrix && <PCRBar pcr={pcrValue} />}
+   640→              </div>
+   641→
+   642→              {/* Confidence Card */}
+   643→              <div className="rounded-lg border border-[#1f2937] bg-[#111827] p-2.5">
+   644→                <div className="text-[9px] text-gray-500 uppercase tracking-wider mb-0.5">Confidence</div>
+   645→                <div className="flex items-center gap-2">
+   646→                  <div className="relative">
+   647→                    <CircularProgress
+   648→                      value={currentSignal ? currentSignal.confidence * 100 : 0}
+   649→                      size={36}
+   650→                      strokeWidth={3}
+   651→                      color={currentSignal ? getConfidenceColor(currentSignal.confidence) : '#374151'}
+   652→                    />
+   653→                    <span className="absolute inset-0 flex items-center justify-center text-[8px] font-bold text-white">
+   654→                      {currentSignal ? `${Math.round(currentSignal.confidence * 100)}` : '-'}
+   655→                    </span>
+   656→                  </div>
+   657→                  <span className={`text-sm font-bold ${currentSignal ? (currentSignal.confidence > 0.7 ? 'text-green-400' : currentSignal.confidence > 0.4 ? 'text-yellow-400' : 'text-red-400') : 'text-gray-500'}`}>
+   658→                    {currentSignal ? `${(currentSignal.confidence * 100).toFixed(1)}%` : 'N/A'}
+   659→                  </span>
+   660→                </div>
+   661→              </div>
+   662→            </div>
+   663→
+   664→            {/* Trade Assistant Panel */}
+   665→            <div className="rounded-lg border border-[#1f2937] bg-[#111827] overflow-hidden flex-1 min-h-0">
+   666→              <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#1f2937]">
+   667→                <div className="flex items-center gap-2">
+   668→                  <Target className="h-3.5 w-3.5 text-yellow-500" />
+   669→                  <span className="text-xs font-semibold text-white">Trade Assistant</span>
+   670→                </div>
+   671→                {activeTrades.length > 0 && (
+   672→                  <Badge className="bg-yellow-600/20 text-yellow-400 border-yellow-600/30 text-[9px] h-4 px-1.5">
+   673→                    {activeTrades.length} active
+   674→                  </Badge>
+   675→                )}
+   676→              </div>
+   677→              <div className="max-h-[220px] overflow-y-auto custom-scrollbar">
+   678→                {activeTrades.length > 0 ? (
+   679→                  <div className="divide-y divide-[#1f2937]">
+   680→                    <AnimatePresence>
+   681→                      {activeTrades.map((trade) => {
+   682→                        const isLong = trade.signal_type === 'LONG';
+   683→                        return (
+   684→                          <motion.div
+   685→                            key={trade.id}
+   686→                            initial={{ opacity: 0, y: -10 }}
+   687→                            animate={{ opacity: 1, y: 0 }}
+   688→                            exit={{ opacity: 0, x: 20 }}
+   689→                            className="p-2.5"
+   690→                          >
+   691→                            {/* Trade header */}
+   692→                            <div className="flex items-center justify-between mb-1.5">
+   693→                              <div className="flex items-center gap-1.5">
+   694→                                <Badge className={`text-[9px] h-4 px-1.5 ${isLong ? 'bg-green-600/20 text-green-400 border-green-600/30' : 'bg-red-600/20 text-red-400 border-red-600/30'}`}>
+   695→                                  {trade.signal_type}
+   696→                                </Badge>
+   697→                                <span className="text-[10px] text-gray-300 font-medium">{trade.option_suggestion}</span>
+   698→                              </div>
+   699→                              <div className="flex items-center gap-1">
+   700→                                <button
+   701→                                  onClick={() => dismissTrade(trade.id)}
+   702→                                  className="h-5 w-5 rounded flex items-center justify-center hover:bg-[#1f2937] text-gray-500 hover:text-gray-300 transition-colors"
+   703→                                >
+   704→                                  <X className="h-3 w-3" />
+   705→                                </button>
+   706→                              </div>
+   707→                            </div>
+   708→
+   709→                            {/* Trade details */}
+   710→                            <div className="grid grid-cols-4 gap-1.5 mb-1.5">
+   711→                              <div>
+   712→                                <div className="text-[8px] text-gray-500 uppercase">Entry</div>
+   713→                                <div className="text-[11px] font-semibold text-white">{trade.entry_price.toFixed(1)}</div>
+   714→                              </div>
+   715→                              <div>
+   716→                                <div className="text-[8px] text-gray-500 uppercase">SL</div>
+   717→                                <div className="text-[11px] font-semibold text-red-400">{trade.stop_loss.toFixed(1)}</div>
+   718→                              </div>
+   719→                              <div>
+   720→                                <div className="text-[8px] text-gray-500 uppercase">Target</div>
+   721→                                <div className="text-[11px] font-semibold text-green-400">{trade.target.toFixed(1)}</div>
+   722→                              </div>
+   723→                              <div>
+   724→                                <div className="text-[8px] text-gray-500 uppercase">R:R</div>
+   725→                                <div className="text-[11px] font-semibold text-yellow-400">{trade.risk_reward}</div>
+   726→                              </div>
+   727→                            </div>
+   728→
+   729→                            {/* Reason + confidence */}
+   730→                            <div className="flex items-center justify-between">
+   731→                              <div className="text-[9px] text-gray-500 flex-1 mr-2 truncate" title={trade.reason}>
+   732→                                {trade.reason}
+   733→                              </div>
+   734→                              <div className="flex items-center gap-1.5">
+   735→                                <span className="text-[9px] text-gray-400">
+   736→                                  {Math.round(trade.confidence * 100)}%
+   737→                                </span>
+   738→                                <button className="h-5 px-2 rounded text-[9px] font-semibold bg-yellow-600 hover:bg-yellow-500 text-white transition-colors">
+   739→                                  Take Trade
+   740→                                </button>
+   741→                              </div>
+   742→                            </div>
+   743→                          </motion.div>
+   744→                        );
+   745→                      })}
+   746→                    </AnimatePresence>
+   747→                  </div>
+   748→                ) : (
+   749→                  <div className="flex flex-col items-center justify-center py-8 text-gray-500">
+   750→                    <Activity className="h-6 w-6 mb-2 animate-pulse text-gray-600" />
+   751→                    <span className="text-[11px]">Waiting for signal...</span>
+   752→                    <span className="text-[9px] text-gray-600 mt-0.5">Trade suggestions will appear here</span>
+   753→                  </div>
+   754→                )}
+   755→              </div>
+   756→            </div>
+   757→
+   758→            {/* Signal Log */}
+   759→            <div className="rounded-lg border border-[#1f2937] bg-[#111827] overflow-hidden flex-1 min-h-0">
+   760→              <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#1f2937]">
+   761→                <div className="flex items-center gap-2">
+   762→                  <Flag className="h-3.5 w-3.5 text-yellow-500" />
+   763→                  <span className="text-xs font-semibold text-white">Signal Log</span>
+   764→                </div>
+   765→                {signals && signals.signals.length > 0 && (
+   766→                  <span className="text-[9px] text-gray-500">{signals.signals.length} signals</span>
+   767→                )}
+   768→              </div>
+   769→              <div
+   770→                ref={signalLogRef}
+   771→                className="max-h-[180px] overflow-y-auto custom-scrollbar"
+   772→              >
+   773→                {signals && signals.signals.length > 0 ? (
+   774→                  <div className="divide-y divide-[#1e222d]">
+   775→                    {signals.signals.slice(-20).reverse().map((sig, idx) => {
+   776→                      const sigStyle = getSignalStyle(sig.signal_type);
+   777→                      return (
+   778→                        <div key={idx} className="flex items-center gap-2 px-3 py-1.5">
+   779→                          <span className={`h-2 w-2 rounded-full shrink-0 ${
+   780→                            sig.signal_type === 'LONG' ? 'bg-green-400' :
+   781→                            sig.signal_type === 'SHORT' ? 'bg-red-400' : 'bg-gray-400'
+   782→                          }`} />
+   783→                          <span className="text-[9px] text-gray-600 w-14 shrink-0">
+   784→                            {formatTimeHHMMSS(sig.timestamp)}
+   785→                          </span>
+   786→                          <span className={`text-[10px] font-semibold w-12 ${sigStyle.text}`}>
+   787→                            {sig.signal_type}
+   788→                          </span>
+   789→                          <span className="text-[10px] text-gray-400 w-12">
+   790→                            PCR {sig.coi_pcr.toFixed(2)}
+   791→                          </span>
+   792→                          <span className="text-[10px] text-gray-500 w-10">
+   793→                            {Math.round(sig.confidence * 100)}%
+   794→                          </span>
+   795→                          <span className="text-[9px] text-gray-600 flex-1 truncate" title={sig.reason}>
+   796→                            {sig.reason}
+   797→                          </span>
+   798→                        </div>
+   799→                      );
+   800→                    })}
+   801→                  </div>
+   802→                ) : (
+   803→                  <div className="py-6 text-center text-[11px] text-gray-600">No signals yet</div>
+   804→                )}
+   805→              </div>
+   806→            </div>
+   807→          </div>
+   808→        </div>
+   809→
+   810→        {/* Bottom Section: Matrix + Trap Clusters + Volume */}
+   811→        <div className="grid grid-cols-1 lg:grid-cols-4 gap-2 sm:gap-3">
+   812→          {/* 7-Strike Matrix Table (3/4) */}
+   813→          <div className="lg:col-span-3 rounded-lg border border-[#1f2937] bg-[#111827] overflow-hidden">
+   814→            <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#1f2937]">
+   815→              <div className="flex items-center gap-2">
+   816→                <ShieldAlert className="h-3.5 w-3.5 text-yellow-500" />
+   817→                <span className="text-xs font-semibold text-white">7-Strike Window</span>
+   818→              </div>
+   819→              {matrix && (
+   820→                <div className="flex items-center gap-3 text-[10px]">
+   821→                  <span className="text-gray-500">Spot: <span className="text-white font-semibold">{matrix.spot_price.toFixed(2)}</span></span>
+   822→                  <span className="text-gray-500">ATM: <span className="text-yellow-400 font-semibold">{matrix.atm_strike}</span></span>
+   823→                </div>
+   824→              )}
+   825→            </div>
+   826→            <div className="overflow-x-auto">
+   827→              <table className="w-full text-[11px]">
+   828→                <thead>
+   829→                  <tr className="border-b border-[#1f2937]">
+   830→                    <th className="text-center px-3 py-1.5 text-gray-500 font-medium">Strike</th>
+   831→                    <th className="text-right px-3 py-1.5 text-gray-500 font-medium">CE COI</th>
+   832→                    <th className="text-right px-3 py-1.5 text-gray-500 font-medium">PE COI</th>
+   833→                    <th className="text-right px-3 py-1.5 text-gray-500 font-medium">CE OI</th>
+   834→                    <th className="text-right px-3 py-1.5 text-gray-500 font-medium">PE OI</th>
+   835→                    <th className="text-center px-3 py-1.5 text-gray-500 font-medium">Bias</th>
+   836→                  </tr>
+   837→                </thead>
+   838→                <tbody>
+   839→                  {matrix?.rows.map((row) => {
+   840→                    const isATM = row.strike === matrix.atm_strike;
+   841→                    const peBias = row.pe_coi > row.ce_coi;
+   842→                    return (
+   843→                      <tr
+   844→                        key={row.strike}
+   845→                        className={`border-b border-[#1e222d] ${isATM ? 'bg-yellow-500/10' : ''}`}
+   846→                      >
+   847→                        <td className={`text-center px-3 py-1.5 font-semibold ${isATM ? 'text-yellow-400' : 'text-white'}`}>
+   848→                          {row.strike}
+   849→                          {isATM && <span className="ml-1 text-[8px] text-yellow-500">ATM</span>}
+   850→                        </td>
+   851→                        <td className="text-right px-3 py-1.5 text-red-400">{formatNumber(row.ce_coi)}</td>
+   852→                        <td className="text-right px-3 py-1.5 text-green-400">{formatNumber(row.pe_coi)}</td>
+   853→                        <td className="text-right px-3 py-1.5 text-gray-300">{formatNumber(row.ce_oi)}</td>
+   854→                        <td className="text-right px-3 py-1.5 text-gray-300">{formatNumber(row.pe_oi)}</td>
+   855→                        <td className="text-center px-3 py-1.5">
+   856→                          {peBias ? (
+   857→                            <ArrowUp className="h-3.5 w-3.5 text-green-400 inline" />
+   858→                          ) : (
+   859→                            <ArrowDown className="h-3.5 w-3.5 text-red-400 inline" />
+   860→                          )}
+   861→                        </td>
+   862→                      </tr>
+   863→                    );
+   864→                  })}
+   865→                </tbody>
+   866→                <tfoot>
+   867→                  <tr className="border-t border-[#1f2937] bg-[#0d1117]">
+   868→                    <td className="text-center px-3 py-1.5 font-semibold text-gray-400">SUM</td>
+   869→                    <td className="text-right px-3 py-1.5 font-semibold text-red-400">
+   870→                      {matrix ? formatNumber(matrix.ce_coi_sum) : '-'}
+   871→                    </td>
+   872→                    <td className="text-right px-3 py-1.5 font-semibold text-green-400">
+   873→                      {matrix ? formatNumber(matrix.pe_coi_sum) : '-'}
+   874→                    </td>
+   875→                    <td colSpan={2} />
+   876→                    <td className="text-center px-3 py-1.5">
+   877→                      <span className={`font-bold text-sm ${
+   878→                        matrix ? (matrix.coi_pcr > 1.2 ? 'text-green-400' : matrix.coi_pcr < 0.8 ? 'text-red-400' : 'text-yellow-400') : 'text-gray-400'
+   879→                      }`}>
+   880→                        {matrix ? matrix.coi_pcr.toFixed(3) : '-'}
+   881→                      </span>
+   882→                    </td>
+   883→                  </tr>
+   884→                </tfoot>
+   885→              </table>
+   886→            </div>
+   887→          </div>
+   888→
+   889→          {/* Right panels: Trap Clusters + Volume Proxy (1/4) */}
+   890→          <div className="flex flex-col gap-2 sm:gap-3">
+   891→            {/* Trap Clusters */}
+   892→            <div className="rounded-lg border border-[#1f2937] bg-[#111827] overflow-hidden flex-1">
+   893→              <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#1f2937]">
+   894→                <div className="flex items-center gap-2">
+   895→                  <AlertTriangle className="h-3.5 w-3.5 text-orange-500" />
+   896→                  <span className="text-xs font-semibold text-white">Trap Clusters</span>
+   897→                </div>
+   898→                {activeTrapClusters.length > 0 && (
+   899→                  <Badge className="bg-orange-600/20 text-orange-400 border-orange-600/30 text-[9px] h-4 px-1.5">
+   900→                    {activeTrapClusters.length}
+   901→                  </Badge>
+   902→                )}
+   903→              </div>
+   904→              <div className="max-h-[180px] overflow-y-auto custom-scrollbar">
+   905→                {activeTrapClusters.length > 0 ? (
+   906→                  <div className="divide-y divide-[#1e222d]">
+   907→                    {activeTrapClusters.map((cluster) => {
+   908→                      const isBullish = cluster.direction === 'BULLISH_TRAP';
+   909→                      return (
+   910→                        <div key={cluster.id} className="px-3 py-2">
+   911→                          <div className="flex items-center justify-between mb-1">
+   912→                            <Badge className={`text-[9px] h-4 px-1.5 ${isBullish ? 'bg-red-600/20 text-red-400 border-red-600/30' : 'bg-green-600/20 text-green-400 border-green-600/30'}`}>
+   913→                              {isBullish ? 'BULL TRAP' : 'BEAR TRAP'}
+   914→                            </Badge>
+   915→                            <span className="text-[9px] text-gray-500">{timeSince(cluster.timestamp_start)}</span>
+   916→                          </div>
+   917→                          <div className="flex items-center justify-between text-[10px]">
+   918→                            <span className="text-gray-400">
+   919→                              {cluster.price_low.toFixed(0)} - {cluster.price_high.toFixed(0)}
+   920→                            </span>
+   921→                            <span className="text-gray-500">
+   922→                              Vol: {formatNumber(cluster.volume_trapped)}
+   923→                            </span>
+   924→                          </div>
+   925→                          {/* Pain index bar */}
+   926→                          <div className="mt-1.5">
+   927→                            <div className="flex items-center justify-between mb-0.5">
+   928→                              <span className="text-[8px] text-gray-500 uppercase">Pain Index</span>
+   929→                              <span className={`text-[9px] font-semibold ${cluster.pain_index > 3 ? 'text-red-400' : cluster.pain_index > 1.5 ? 'text-orange-400' : 'text-yellow-400'}`}>
+   930→                                {cluster.pain_index.toFixed(1)} / 5
+   931→                              </span>
+   932→                            </div>
+   933→                            <div className="h-1.5 w-full rounded-full bg-[#1f2937] overflow-hidden">
+   934→                              <div
+   935→                                className={`h-full rounded-full transition-all duration-500 ${cluster.pain_index > 3 ? 'bg-red-500' : cluster.pain_index > 1.5 ? 'bg-orange-500' : 'bg-yellow-500'}`}
+   936→                                style={{ width: `${Math.min((cluster.pain_index / 5) * 100, 100)}%` }}
+   937→                              />
+   938→                            </div>
+   939→                          </div>
+   940→                        </div>
+   941→                      );
+   942→                    })}
+   943→                  </div>
+   944→                ) : (
+   945→                  <div className="py-6 text-center text-[11px] text-gray-600">No active traps</div>
+   946→                )}
+   947→              </div>
+   948→            </div>
+   949→
+   950→            {/* Volume Proxy */}
+   951→            <div className="rounded-lg border border-[#1f2937] bg-[#111827] overflow-hidden">
+   952→              <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#1f2937]">
+   953→                <div className="flex items-center gap-2">
+   954→                  <Volume2 className="h-3.5 w-3.5 text-blue-500" />
+   955→                  <span className="text-xs font-semibold text-white">Volume Proxy</span>
+   956→                </div>
+   957→              </div>
+   958→              <div className="p-3">
+   959→                {currentVolume ? (
+   960→                  <>
+   961→                    <div className="flex items-center justify-between mb-2">
+   962→                      <span className="text-[10px] text-gray-500">Classification</span>
+   963→                      <Badge className={`text-[9px] h-5 px-2 ${getVolumeClassification(currentVolume.classification).bg} ${getVolumeClassification(currentVolume.classification).text} border`}>
+   964→                        {currentVolume.classification}
+   965→                      </Badge>
+   966→                    </div>
+   967→                    <div className="flex items-center justify-between mb-2">
+   968→                      <span className="text-[10px] text-gray-500">Volume %</span>
+   969→                      <span className={`text-lg font-bold ${
+   970→                        currentVolume.classification === 'EXTREME' ? 'text-red-400' :
+   971→                        currentVolume.classification === 'HIGH' ? 'text-orange-400' :
+   972→                        currentVolume.classification === 'ELEVATED' ? 'text-yellow-400' : 'text-gray-300'
+   973→                      }`}>
+   974→                        {currentVolume.volume_percent.toFixed(1)}x
+   975→                      </span>
+   976→                    </div>
+   977→                    {/* Volume bar visualization */}
+   978→                    <div className="h-2 w-full rounded-full bg-[#1f2937] overflow-hidden">
+   979→                      <div
+   980→                        className={`h-full rounded-full transition-all duration-500 ${
+   981→                          currentVolume.classification === 'EXTREME' ? 'bg-red-500' :
+   982→                          currentVolume.classification === 'HIGH' ? 'bg-orange-500' :
+   983→                          currentVolume.classification === 'ELEVATED' ? 'bg-yellow-500' : 'bg-gray-500'
+   984→                        }`}
+   985→                        style={{ width: `${Math.min((currentVolume.volume_percent / 6) * 100, 100)}%` }}
+   986→                      />
+   987→                    </div>
+   988→                    <div className="flex items-center justify-between mt-1">
+   989→                      <span className="text-[8px] text-gray-600">0x</span>
+   990→                      <span className="text-[8px] text-gray-600">3x</span>
+   991→                      <span className="text-[8px] text-gray-600">6x</span>
+   992→                    </div>
+   993→                  </>
+   994→                ) : (
+   995→                  <div className="py-3 text-center text-[11px] text-gray-600">No data</div>
+   996→                )}
+   997→              </div>
+   998→            </div>
+   999→          </div>
+  1000→        </div>
+  1001→      </div>
+  1002→
+  1003→      {/* Custom scrollbar styles */}
+  1004→      <style jsx global>{`
+  1005→        .custom-scrollbar::-webkit-scrollbar {
+  1006→          width: 4px;
+  1007→        }
+  1008→        .custom-scrollbar::-webkit-scrollbar-track {
+  1009→          background: #0a0e17;
+  1010→        }
+  1011→        .custom-scrollbar::-webkit-scrollbar-thumb {
+  1012→          background: #1f2937;
+  1013→          border-radius: 2px;
+  1014→        }
+  1015→        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  1016→          background: #374151;
+  1017→        }
+  1018→      `}</style>
+  1019→    </div>
+  1020→  );
+  1021→}
+  1022→

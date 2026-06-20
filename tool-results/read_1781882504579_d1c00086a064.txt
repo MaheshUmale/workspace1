@@ -1,0 +1,1094 @@
+     1→// ============================================================
+     2→// Market Data Simulator — Singleton Engine
+     3→// Generates realistic Indian market data in-memory
+     4→// ============================================================
+     5→
+     6→// ============ Seeded PRNG (Mulberry32) ============
+     7→
+     8→function mulberry32(seed: number): () => number {
+     9→  let s = seed | 0;
+    10→  return () => {
+    11→    s = (s + 0x6d2b79f5) | 0;
+    12→    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    13→    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    14→    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    15→  };
+    16→}
+    17→
+    18→// ============ Normal distribution (Box-Muller) ============
+    19→
+    20→function normalRandom(rng: () => number, mean = 0, std = 1): number {
+    21→  const u1 = rng();
+    22→  const u2 = rng();
+    23→  const z = Math.sqrt(-2 * Math.log(u1 || 1e-10)) * Math.cos(2 * Math.PI * u2);
+    24→  return z * std + mean;
+    25→}
+    26→
+    27→// ============ Types ============
+    28→
+    29→export interface CandleData {
+    30→  time: number;
+    31→  open: number;
+    32→  high: number;
+    33→  low: number;
+    34→  close: number;
+    35→  volume: number;
+    36→}
+    37→
+    38→export interface SpotTick {
+    39→  symbol: string;
+    40→  ltp: number;
+    41→  change: number;
+    42→  change_pct: number;
+    43→  open: number;
+    44→  high: number;
+    45→  low: number;
+    46→  close: number;
+    47→  volume: number;
+    48→  timestamp: number;
+    49→}
+    50→
+    51→export interface OptionEntry {
+    52→  instrument_key: string;
+    53→  ltp: number;
+    54→  oi: number;
+    55→  change_oi: number;
+    56→  volume: number;
+    57→  iv: number;
+    58→  delta: number;
+    59→  gamma: number;
+    60→  theta: number;
+    61→  vega: number;
+    62→  bid_price: number;
+    63→  ask_price: number;
+    64→}
+    65→
+    66→export interface OptionChainRow {
+    67→  strike: number;
+    68→  ce: OptionEntry;
+    69→  pe: OptionEntry;
+    70→}
+    71→
+    72→export interface MiniOptionEntry {
+    73→  instrument_key: string;
+    74→  ltp: number;
+    75→  oi: number;
+    76→  change_oi: number;
+    77→  volume: number;
+    78→  iv: number;
+    79→  delta: number;
+    80→  bid_price: number;
+    81→  ask_price: number;
+    82→}
+    83→
+    84→export interface MiniOptionChainRow {
+    85→  strike: number;
+    86→  ce: MiniOptionEntry;
+    87→  pe: MiniOptionEntry;
+    88→}
+    89→
+    90→export interface Instrument {
+    91→  instrument_key: string;
+    92→  name: string;
+    93→  underlying: string;
+    94→  type: 'INDEX' | 'FUT' | 'CE' | 'PE';
+    95→  expiry?: string;
+    96→  strike?: number;
+    97→  display_name?: string;
+    98→}
+    99→
+   100→export interface ExpiryInfo {
+   101→  expiry_date: string;
+   102→  expiry_label: string;
+   103→  is_weekly: boolean;
+   104→  days_to_expiry: number;
+   105→}
+   106→
+   107→export interface OIDatum {
+   108→  timestamp: number;
+   109→  strike: number;
+   110→  ce_oi: number;
+   111→  ce_change_oi: number;
+   112→  pe_oi: number;
+   113→  pe_change_oi: number;
+   114→}
+   115→
+   116→export interface PCRPoint {
+   117→  timestamp: number;
+   118→  spot: number;
+   119→  pcr: number;
+   120→  change_pcr: number;
+   121→}
+   122→
+   123→export interface SevenStrikeRow {
+   124→  strike: number;
+   125→  ce_coi: number;
+   126→  pe_coi: number;
+   127→  ce_oi: number;
+   128→  pe_oi: number;
+   129→}
+   130→
+   131→export interface SevenStrikeMatrix {
+   132→  underlying: string;
+   133→  expiry: string;
+   134→  spot_price: number;
+   135→  atm_strike: number;
+   136→  strike_step: number;
+   137→  window_strikes: number[];
+   138→  rows: SevenStrikeRow[];
+   139→  ce_coi_sum: number;
+   140→  pe_coi_sum: number;
+   141→  coi_pcr: number;
+   142→  state: string;
+   143→}
+   144→
+   145→export interface Signal {
+   146→  signal_type: string;
+   147→  confidence: number;
+   148→  reason: string;
+   149→  timestamp: number;
+   150→  spot_price: number;
+   151→  coi_pcr: number;
+   152→  volume_percent: number | null;
+   153→  gate_condition: string | null;
+   154→  pain_index: number | null;
+   155→}
+   156→
+   157→export interface SevenStrikeSignals {
+   158→  underlying: string;
+   159→  expiry: string;
+   160→  signals: Signal[];
+   161→  current_signal: Signal | null;
+   162→  gate_condition: string;
+   163→  state: string;
+   164→}
+   165→
+   166→// ============ Helper functions ============
+   167→
+   168→function nextThursdays(count: number): Date[] {
+   169→  const now = new Date();
+   170→  const results: Date[] = [];
+   171→  const d = new Date(now);
+   172→  // Find next Thursday (4 = Thursday)
+   173→  while (d.getDay() !== 4) {
+   174→    d.setDate(d.getDate() + 1);
+   175→  }
+   176→  for (let i = 0; i < count; i++) {
+   177→    results.push(new Date(d));
+   178→    d.setDate(d.getDate() + 7);
+   179→  }
+   180→  return results;
+   181→}
+   182→
+   183→function formatDateLabel(d: Date): string {
+   184→  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+   185→  return `${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}`;
+   186→}
+   187→
+   188→function formatExpiryDate(d: Date): string {
+   189→  const y = d.getFullYear();
+   190→  const m = String(d.getMonth() + 1).padStart(2, '0');
+   191→  const day = String(d.getDate()).padStart(2, '0');
+   192→  return `${y}-${m}-${day}`;
+   193→}
+   194→
+   195→function compactExpiry(expiryDate: string): string {
+   196→  // "2026-06-25" -> "260625"
+   197→  return expiryDate.replace(/-/g, '').slice(2);
+   198→}
+   199→
+   200→// Cumulative Normal Distribution (Abramowitz & Stegun approximation)
+   201→function cdf(x: number): number {
+   202→  const a1 = 0.254829592;
+   203→  const a2 = -0.284496736;
+   204→  const a3 = 1.421413741;
+   205→  const a4 = -1.453152027;
+   206→  const a5 = 1.061405429;
+   207→  const p = 0.3275911;
+   208→  const sign = x < 0 ? -1 : 1;
+   209→  x = Math.abs(x) / Math.SQRT2;
+   210→  const t = 1.0 / (1.0 + p * x);
+   211→  const y = 1.0 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+   212→  return 0.5 * (1.0 + sign * y);
+   213→}
+   214→
+   215→// Standard Normal PDF
+   216→function ndist(x: number): number {
+   217→  return Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
+   218→}
+   219→
+   220→// ============ Constants ============
+   221→
+   222→const UNDERLYING_CONFIG: Record<string, {
+   223→  basePrice: number;
+   224→  strikeStep: number;
+   225→  volatility: number;
+   226→  displayName: string;
+   227→}> = {
+   228→  NIFTY: {
+   229→    basePrice: 23500,
+   230→    strikeStep: 50,
+   231→    volatility: 0.13,
+   232→    displayName: 'NIFTY 50',
+   233→  },
+   234→  BANKNIFTY: {
+   235→    basePrice: 51000,
+   236→    strikeStep: 100,
+   237→    volatility: 0.16,
+   238→    displayName: 'BANK NIFTY',
+   239→  },
+   240→};
+   241→
+   242→const TIMEFRAME_SECONDS: Record<string, number> = {
+   243→  '1m': 60,
+   244→  '3m': 180,
+   245→  '5m': 300,
+   246→  '15m': 900,
+   247→  '1h': 3600,
+   248→};
+   249→
+   250→const RISK_FREE_RATE = 0.07;
+   251→
+   252→// ============ Market Simulator Class ============
+   253→
+   254→class MarketSimulator {
+   255→  private rng: () => number;
+   256→  private spotPrices: Record<string, number>;
+   257→  private openPrices: Record<string, number>;
+   258→  private highPrices: Record<string, number>;
+   259→  private lowPrices: Record<string, number>;
+   260→  private prevClosePrices: Record<string, number>;
+   261→  private volumes: Record<string, number>;
+   262→  private candles: Record<string, CandleData[]>;
+   263→  private oiData: Record<string, Record<number, { ce_oi: number; ce_change_oi: number; pe_oi: number; pe_change_oi: number }>>;
+   264→  private pcrHistory: Record<string, PCRPoint[]>;
+   265→  private tickCount: number;
+   266→  private signalHistory: Record<string, Signal[]>;
+   267→  private lastState: Record<string, string>;
+   268→  private lastPcr: Record<string, number>;
+   269→
+   270→  constructor() {
+   271→    this.rng = mulberry32(42);
+   272→    this.spotPrices = {};
+   273→    this.openPrices = {};
+   274→    this.highPrices = {};
+   275→    this.lowPrices = {};
+   276→    this.prevClosePrices = {};
+   277→    this.volumes = {};
+   278→    this.candles = {};
+   279→    this.oiData = {};
+   280→    this.pcrHistory = {};
+   281→    this.tickCount = 0;
+   282→    this.signalHistory = {};
+   283→    this.lastState = {};
+   284→    this.lastPcr = {};
+   285→
+   286→    // Initialize for each underlying
+   287→    for (const [symbol, config] of Object.entries(UNDERLYING_CONFIG)) {
+   288→      const startPrice = config.basePrice + (this.rng() - 0.5) * config.basePrice * 0.02;
+   289→      this.spotPrices[symbol] = startPrice;
+   290→      this.openPrices[symbol] = startPrice;
+   291→      this.highPrices[symbol] = startPrice * 1.005;
+   292→      this.lowPrices[symbol] = startPrice * 0.995;
+   293→      this.prevClosePrices[symbol] = startPrice * (1 + (this.rng() - 0.5) * 0.01);
+   294→      this.volumes[symbol] = Math.floor(this.rng() * 5_000_000) + 1_000_000;
+   295→      this.candles[symbol] = [];
+   296→      this.oiData[symbol] = {};
+   297→      this.pcrHistory[symbol] = [];
+   298→      this.signalHistory[symbol] = [];
+   299→      this.lastState[symbol] = 'IDLE';
+   300→      this.lastPcr[symbol] = 1.0;
+   301→    }
+   302→
+   303→    // Generate historical candle data for each underlying and timeframe
+   304→    this.generateHistoricalCandles();
+   305→    // Generate initial OI data
+   306→    this.generateInitialOI();
+   307→    // Generate initial PCR history
+   308→    this.generateInitialPCR();
+   309→  }
+   310→
+   311→  // ============ Spot Price Generation ============
+   312→
+   313→  generateTick(symbol: string): SpotTick {
+   314→    const config = UNDERLYING_CONFIG[symbol];
+   315→    if (!config) {
+   316→      throw new Error(`Unknown symbol: ${symbol}`);
+   317→    }
+   318→
+   319→    const prevPrice = this.spotPrices[symbol];
+   320→    // GBM: dS = mu * S * dt + sigma * S * sqrt(dt) * Z
+   321→    const mu = 0.0001; // small drift
+   322→    const dt = 1 / 252 / 375; // ~1 tick in a trading day
+   323→    const sigma = config.volatility;
+   324→    const z = normalRandom(this.rng);
+   325→    const dS = mu * prevPrice * dt + sigma * prevPrice * Math.sqrt(dt) * z;
+   326→    const newPrice = Math.max(prevPrice + dS, prevPrice * 0.95); // prevent going too low
+   327→
+   328→    this.spotPrices[symbol] = newPrice;
+   329→    this.highPrices[symbol] = Math.max(this.highPrices[symbol], newPrice);
+   330→    this.lowPrices[symbol] = Math.min(this.lowPrices[symbol], newPrice);
+   331→    this.volumes[symbol] += Math.floor(this.rng() * 5000) + 100;
+   332→
+   333→    const change = newPrice - this.prevClosePrices[symbol];
+   334→    const changePct = (change / this.prevClosePrices[symbol]) * 100;
+   335→
+   336→    this.tickCount++;
+   337→
+   338→    // Occasionally update OI
+   339→    if (this.tickCount % 5 === 0) {
+   340→      this.updateOI(symbol);
+   341→    }
+   342→
+   343→    return {
+   344→      symbol,
+   345→      ltp: Math.round(newPrice * 100) / 100,
+   346→      change: Math.round(change * 100) / 100,
+   347→      change_pct: Math.round(changePct * 100) / 100,
+   348→      open: Math.round(this.openPrices[symbol] * 100) / 100,
+   349→      high: Math.round(this.highPrices[symbol] * 100) / 100,
+   350→      low: Math.round(this.lowPrices[symbol] * 100) / 100,
+   351→      close: Math.round(newPrice * 100) / 100,
+   352→      volume: this.volumes[symbol],
+   353→      timestamp: Date.now(),
+   354→    };
+   355→  }
+   356→
+   357→  getSpotPrice(symbol: string): number {
+   358→    return this.spotPrices[symbol] ?? UNDERLYING_CONFIG[symbol]?.basePrice ?? 23500;
+   359→  }
+   360→
+   361→  // ============ Historical Candle Generation ============
+   362→
+   363→  private generateHistoricalCandles(): void {
+   364→    const now = Math.floor(Date.now() / 1000);
+   365→
+   366→    for (const symbol of Object.keys(UNDERLYING_CONFIG)) {
+   367→      for (const [tf, tfSeconds] of Object.entries(TIMEFRAME_SECONDS)) {
+   368→        const key = `${symbol}_${tf}`;
+   369→        const candles: CandleData[] = [];
+   370→        const numCandles = 220;
+   371→        const startPrice = this.spotPrices[symbol];
+   372→        const config = UNDERLYING_CONFIG[symbol];
+   373→        let price = startPrice * (1 + (this.rng() - 0.5) * 0.03); // start a bit off
+   374→
+   375→        // Use a separate deterministic rng for candles based on symbol+tf
+   376→        const candleRng = mulberry32(
+   377→          symbol === 'NIFTY' ? 1234 : 5678 + (tf === '1m' ? 0 : tf === '3m' ? 1 : tf === '5m' ? 2 : tf === '15m' ? 3 : 4)
+   378→        );
+   379→
+   380→        for (let i = numCandles; i > 0; i--) {
+   381→          const time = now - i * tfSeconds;
+   382→          const open = price;
+   383→          // Simulate intra-candle movement
+   384→          const numSteps = tf === '1h' ? 60 : tf === '15m' ? 15 : tf === '5m' ? 5 : tf === '3m' ? 3 : 1;
+   385→          let high = open;
+   386→          let low = open;
+   387→          let close = open;
+   388→
+   389→          for (let s = 0; s < numSteps; s++) {
+   390→            const mu = 0.00002;
+   391→            const dt = 1 / 252 / 375;
+   392→            const sigma = config.volatility;
+   393→            const z = normalRandom(candleRng);
+   394→            const dS = mu * close * dt + sigma * close * Math.sqrt(dt) * z;
+   395→            close = Math.max(close + dS, close * 0.98);
+   396→            high = Math.max(high, close);
+   397→            low = Math.min(low, close);
+   398→          }
+   399→
+   400→          const volume = Math.floor(candleRng() * 200000) + 50000 +
+   401→            Math.floor(Math.sin(i / 20) * 30000); // periodic volume pattern
+   402→
+   403→          candles.push({
+   404→            time,
+   405→            open: Math.round(open * 100) / 100,
+   406→            high: Math.round(high * 100) / 100,
+   407→            low: Math.round(low * 100) / 100,
+   408→            close: Math.round(close * 100) / 100,
+   409→            volume: Math.max(volume, 1000),
+   410→          });
+   411→
+   412→          price = close;
+   413→        }
+   414→
+   415→        // Make sure last candle aligns with current price
+   416→        if (candles.length > 0) {
+   417→          candles[candles.length - 1].close = Math.round(this.spotPrices[symbol] * 100) / 100;
+   418→        }
+   419→
+   420→        this.candles[key] = candles;
+   421→      }
+   422→    }
+   423→  }
+   424→
+   425→  // ============ OI Generation ============
+   426→
+   427→  private generateInitialOI(): void {
+   428→    for (const [symbol, config] of Object.entries(UNDERLYING_CONFIG)) {
+   429→      const spot = this.spotPrices[symbol];
+   430→      const step = config.strikeStep;
+   431→      const atm = Math.round(spot / step) * step;
+   432→      const strikes = this.getStrikes(symbol, 10);
+   433→
+   434→      this.oiData[symbol] = {};
+   435→      for (const strike of strikes) {
+   436→        const distanceFromATM = Math.abs(strike - atm);
+   437→        const roundBonus = strike % 1000 === 0 ? 1.5 : strike % 500 === 0 ? 1.2 : 1.0;
+   438→        const baseOI = Math.floor(
+   439→          (2_000_000 + this.rng() * 4_000_000) *
+   440→          Math.exp(-distanceFromATM / (step * 15)) *
+   441→          roundBonus
+   442→        );
+   443→
+   444→        const ceChangeOi = Math.floor((this.rng() - 0.4) * 400_000);
+   445→        const peChangeOi = Math.floor((this.rng() - 0.4) * 400_000);
+   446→
+   447→        this.oiData[symbol][strike] = {
+   448→          ce_oi: baseOI + Math.floor(this.rng() * 1_000_000),
+   449→          ce_change_oi: ceChangeOi,
+   450→          pe_oi: baseOI + Math.floor(this.rng() * 1_000_000),
+   451→          pe_change_oi: peChangeOi,
+   452→        };
+   453→      }
+   454→    }
+   455→  }
+   456→
+   457→  private updateOI(symbol: string): void {
+   458→    const data = this.oiData[symbol];
+   459→    if (!data) return;
+   460→    for (const strike of Object.keys(data)) {
+   461→      const s = Number(strike);
+   462→      const d = data[s];
+   463→      // Small random OI changes
+   464→      d.ce_change_oi += Math.floor((this.rng() - 0.45) * 10_000);
+   465→      d.pe_change_oi += Math.floor((this.rng() - 0.45) * 10_000);
+   466→      d.ce_oi += Math.floor(this.rng() * 5_000);
+   467→      d.pe_oi += Math.floor(this.rng() * 5_000);
+   468→      // Clamp change OI to reasonable range
+   469→      d.ce_change_oi = Math.max(-d.ce_oi, Math.min(d.ce_oi, d.ce_change_oi));
+   470→      d.pe_change_oi = Math.max(-d.pe_oi, Math.min(d.pe_oi, d.pe_change_oi));
+   471→    }
+   472→  }
+   473→
+   474→  private getStrikes(symbol: string, numEachSide: number): number[] {
+   475→    const config = UNDERLYING_CONFIG[symbol];
+   476→    const spot = this.spotPrices[symbol];
+   477→    const step = config.strikeStep;
+   478→    const atm = Math.round(spot / step) * step;
+   479→    const strikes: number[] = [];
+   480→    for (let i = -numEachSide; i <= numEachSide; i++) {
+   481→      strikes.push(atm + i * step);
+   482→    }
+   483→    return strikes;
+   484→  }
+   485→
+   486→  // ============ PCR History ============
+   487→
+   488→  private generateInitialPCR(): void {
+   489→    const now = Date.now();
+   490→    for (const symbol of Object.keys(UNDERLYING_CONFIG)) {
+   491→      const pcrPoints: PCRPoint[] = [];
+   492→      let lastPcr = 0.9 + this.rng() * 0.3;
+   493→      const baseSpot = this.spotPrices[symbol];
+   494→      let spot = baseSpot * (1 + (this.rng() - 0.5) * 0.01);
+   495→
+   496→      for (let i = 60; i > 0; i--) {
+   497→        const timestamp = now - i * 60_000; // 1-minute intervals
+   498→        spot += (this.rng() - 0.5) * baseSpot * 0.001;
+   499→        lastPcr += (this.rng() - 0.5) * 0.05;
+   500→        lastPcr = Math.max(0.3, Math.min(2.5, lastPcr));
+   501→        const change_pcr = (this.rng() - 0.5) * 0.1;
+   502→
+   503→        pcrPoints.push({
+   504→          timestamp,
+   505→          spot: Math.round(spot * 100) / 100,
+   506→          pcr: Math.round(lastPcr * 1000) / 1000,
+   507→          change_pcr: Math.round(change_pcr * 1000) / 1000,
+   508→        });
+   509→      }
+   510→
+   511→      this.pcrHistory[symbol] = pcrPoints;
+   512→      this.lastPcr[symbol] = lastPcr;
+   513→    }
+   514→  }
+   515→
+   516→  // ============ Black-Scholes Pricing ============
+   517→
+   518→  private bsPrice(
+   519→    S: number, K: number, T: number, sigma: number, type: 'CE' | 'PE'
+   520→  ): { price: number; delta: number; gamma: number; theta: number; vega: number } {
+   521→    if (T <= 0) {
+   522→      // At expiry
+   523→      const intrinsic = type === 'CE' ? Math.max(S - K, 0) : Math.max(K - S, 0);
+   524→      return { price: intrinsic, delta: 0, gamma: 0, theta: 0, vega: 0 };
+   525→    }
+   526→
+   527→    const r = RISK_FREE_RATE;
+   528→    const sqrtT = Math.sqrt(T);
+   529→    const d1 = (Math.log(S / K) + (r + (sigma * sigma) / 2) * T) / (sigma * sqrtT);
+   530→    const d2 = d1 - sigma * sqrtT;
+   531→
+   532→    const nd1 = cdf(d1);
+   533→    const nd2 = cdf(d2);
+   534→    const nNd1 = cdf(-d1);
+   535→    const nNd2 = cdf(-d2);
+   536→    const npd1 = ndist(d1);
+   537→
+   538→    let price: number;
+   539→    let delta: number;
+   540→
+   541→    if (type === 'CE') {
+   542→      price = S * nd1 - K * Math.exp(-r * T) * nd2;
+   543→      delta = nd1;
+   544→    } else {
+   545→      price = K * Math.exp(-r * T) * nNd2 - S * nNd1;
+   546→      delta = nd1 - 1;
+   547→    }
+   548→
+   549→    const gamma = npd1 / (S * sigma * sqrtT);
+   550→    const theta = (
+   551→      -(S * npd1 * sigma) / (2 * sqrtT) -
+   552→      (type === 'CE' ? r * K * Math.exp(-r * T) * nd2 : -r * K * Math.exp(-r * T) * nNd2)
+   553→    ) / 365;
+   554→    const vega = (S * npd1 * sqrtT) / 100;
+   555→
+   556→    return {
+   557→      price: Math.max(price, 0.05),
+   558→      delta: Math.round(delta * 10000) / 10000,
+   559→      gamma: Math.round(gamma * 1000000) / 1000000,
+   560→      theta: Math.round(theta * 100) / 100,
+   561→      vega: Math.round(vega * 100) / 100,
+   562→    };
+   563→  }
+   564→
+   565→  private getIV(strike: number, atm: number, baseIV: number): number {
+   566→    // IV smile: higher IV for OTM options
+   567→    const moneyness = (strike - atm) / atm;
+   568→    const skew = moneyness * moneyness * 2; // quadratic smile
+   569→    // Add slight negative skew (put IV > call IV)
+   570→    const tilt = -moneyness * 0.05;
+   571→    return Math.max(0.05, baseIV + skew + tilt + (this.rng() - 0.5) * 0.02);
+   572→  }
+   573→
+   574→  // ============ Public API Methods ============
+   575→
+   576→  getCandles(instrumentKey: string, timeframe: string): CandleData[] {
+   577→    // instrumentKey can be "NIFTY", "BANKNIFTY", or option key like "NSE_FO|NIFTY26062523500CE"
+   578→    let symbol = instrumentKey;
+   579→    if (instrumentKey.startsWith('NSE_FO|')) {
+   580→      const parsed = this.parseInstrumentKeySimple(instrumentKey);
+   581→      if (parsed) symbol = parsed.underlying;
+   582→    }
+   583→
+   584→    const tf = TIMEFRAME_SECONDS[timeframe] ? timeframe : '1m';
+   585→    const key = `${symbol}_${tf}`;
+   586→    return this.candles[key] || [];
+   587→  }
+   588→
+   589→  private parseInstrumentKeySimple(key: string): { underlying: string; expiry: string; strike: number; optionType: string } | null {
+   590→    try {
+   591→      const parts = key.split('|');
+   592→      if (parts.length < 2) return null;
+   593→      const body = parts[1];
+   594→
+   595→      let underlying = '';
+   596→      let rest = body;
+   597→      if (body.startsWith('BANKNIFTY')) {
+   598→        underlying = 'BANKNIFTY';
+   599→        rest = body.slice(9);
+   600→      } else if (body.startsWith('NIFTY')) {
+   601→        underlying = 'NIFTY';
+   602→        rest = body.slice(5);
+   603→      } else {
+   604→        return null;
+   605→      }
+   606→
+   607→      const optionType = rest.endsWith('CE') ? 'CE' : rest.endsWith('PE') ? 'PE' : '';
+   608→      if (!optionType) return null;
+   609→      rest = rest.slice(0, -2);
+   610→
+   611→      const strikeMatch = rest.match(/(\d+)$/);
+   612→      if (!strikeMatch) return null;
+   613→      const strike = parseInt(strikeMatch[1]);
+   614→      const expiryPart = rest.slice(0, -strikeMatch[1].length);
+   615→
+   616→      const year = 2000 + parseInt(expiryPart.slice(0, 2));
+   617→      const month = parseInt(expiryPart.slice(2, 4));
+   618→      const day = parseInt(expiryPart.slice(4, 6));
+   619→      const expiry = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+   620→
+   621→      return { underlying, expiry, strike, optionType };
+   622→    } catch {
+   623→      return null;
+   624→    }
+   625→  }
+   626→
+   627→  getOptionChain(underlying: string, expiry: string): {
+   628→    underlying: string;
+   629→    expiry: string;
+   630→    spot_price: number;
+   631→    atm_strike: number;
+   632→    strike_step: number;
+   633→    chain: OptionChainRow[];
+   634→  } {
+   635→    const config = UNDERLYING_CONFIG[underlying];
+   636→    if (!config) {
+   637→      return { underlying, expiry, spot_price: 0, atm_strike: 0, strike_step: 0, chain: [] };
+   638→    }
+   639→
+   640→    const spot = this.getSpotPrice(underlying);
+   641→    const step = config.strikeStep;
+   642→    const atm = Math.round(spot / step) * step;
+   643→    const strikes = this.getStrikes(underlying, 10);
+   644→
+   645→    // Parse expiry for time calculation
+   646→    const T = this.timeToExpiry(expiry);
+   647→    const baseIV = config.volatility;
+   648→
+   649→    const chain: OptionChainRow[] = strikes.map((strike) => {
+   650→      const iv = this.getIV(strike, atm, baseIV);
+   651→      const ceGreeks = this.bsPrice(spot, strike, T, iv, 'CE');
+   652→      const peGreeks = this.bsPrice(spot, strike, T, iv, 'PE');
+   653→      const oiInfo = this.oiData[underlying]?.[strike] || { ce_oi: 0, ce_change_oi: 0, pe_oi: 0, pe_change_oi: 0 };
+   654→
+   655→      const spread = Math.max(0.5, ceGreeks.price * 0.005);
+   656→
+   657→      return {
+   658→        strike,
+   659→        ce: {
+   660→          instrument_key: `NSE_FO|${underlying}${compactExpiry(expiry)}${strike}CE`,
+   661→          ltp: Math.round(ceGreeks.price * 100) / 100,
+   662→          oi: oiInfo.ce_oi,
+   663→          change_oi: oiInfo.ce_change_oi,
+   664→          volume: Math.floor(this.rng() * 100_000) + 10_000,
+   665→          iv: Math.round(iv * 100) / 100,
+   666→          delta: ceGreeks.delta,
+   667→          gamma: ceGreeks.gamma,
+   668→          theta: ceGreeks.theta,
+   669→          vega: ceGreeks.vega,
+   670→          bid_price: Math.round((ceGreeks.price - spread / 2) * 100) / 100,
+   671→          ask_price: Math.round((ceGreeks.price + spread / 2) * 100) / 100,
+   672→        },
+   673→        pe: {
+   674→          instrument_key: `NSE_FO|${underlying}${compactExpiry(expiry)}${strike}PE`,
+   675→          ltp: Math.round(peGreeks.price * 100) / 100,
+   676→          oi: oiInfo.pe_oi,
+   677→          change_oi: oiInfo.pe_change_oi,
+   678→          volume: Math.floor(this.rng() * 100_000) + 10_000,
+   679→          iv: Math.round(iv * 100) / 100,
+   680→          delta: peGreeks.delta,
+   681→          gamma: peGreeks.gamma,
+   682→          theta: peGreeks.theta,
+   683→          vega: peGreeks.vega,
+   684→          bid_price: Math.round((peGreeks.price - spread / 2) * 100) / 100,
+   685→          ask_price: Math.round((peGreeks.price + spread / 2) * 100) / 100,
+   686→        },
+   687→      };
+   688→    });
+   689→
+   690→    return {
+   691→      underlying,
+   692→      expiry,
+   693→      spot_price: Math.round(spot * 100) / 100,
+   694→      atm_strike: atm,
+   695→      strike_step: step,
+   696→      chain,
+   697→    };
+   698→  }
+   699→
+   700→  getMiniOptionChain(underlying: string, expiry: string): {
+   701→    underlying: string;
+   702→    expiry: string;
+   703→    spot_price: number;
+   704→    atm_strike: number;
+   705→    strike_step: number;
+   706→    chain: MiniOptionChainRow[];
+   707→  } {
+   708→    const full = this.getOptionChain(underlying, expiry);
+   709→    return {
+   710→      underlying: full.underlying,
+   711→      expiry: full.expiry,
+   712→      spot_price: full.spot_price,
+   713→      atm_strike: full.atm_strike,
+   714→      strike_step: full.strike_step,
+   715→      chain: full.chain.map((row) => ({
+   716→        strike: row.strike,
+   717→        ce: {
+   718→          instrument_key: row.ce.instrument_key,
+   719→          ltp: row.ce.ltp,
+   720→          oi: row.ce.oi,
+   721→          change_oi: row.ce.change_oi,
+   722→          volume: row.ce.volume,
+   723→          iv: row.ce.iv,
+   724→          delta: row.ce.delta,
+   725→          bid_price: row.ce.bid_price,
+   726→          ask_price: row.ce.ask_price,
+   727→        },
+   728→        pe: {
+   729→          instrument_key: row.pe.instrument_key,
+   730→          ltp: row.pe.ltp,
+   731→          oi: row.pe.oi,
+   732→          change_oi: row.pe.change_oi,
+   733→          volume: row.pe.volume,
+   734→          iv: row.pe.iv,
+   735→          delta: row.pe.delta,
+   736→          bid_price: row.pe.bid_price,
+   737→          ask_price: row.pe.ask_price,
+   738→        },
+   739→      })),
+   740→    };
+   741→  }
+   742→
+   743→  getOIData(underlying: string, expiry: string): {
+   744→    underlying: string;
+   745→    expiry: string;
+   746→    spot_price: number;
+   747→    data: OIDatum[];
+   748→  } {
+   749→    const config = UNDERLYING_CONFIG[underlying];
+   750→    if (!config) return { underlying, expiry, spot_price: 0, data: [] };
+   751→
+   752→    const spot = this.getSpotPrice(underlying);
+   753→    const strikes = this.getStrikes(underlying, 10);
+   754→
+   755→    const data: OIDatum[] = strikes.map((strike) => {
+   756→      const oiInfo = this.oiData[underlying]?.[strike] || { ce_oi: 0, ce_change_oi: 0, pe_oi: 0, pe_change_oi: 0 };
+   757→      return {
+   758→        timestamp: Date.now(),
+   759→        strike,
+   760→        ce_oi: oiInfo.ce_oi,
+   761→        ce_change_oi: oiInfo.ce_change_oi,
+   762→        pe_oi: oiInfo.pe_oi,
+   763→        pe_change_oi: oiInfo.pe_change_oi,
+   764→      };
+   765→    });
+   766→
+   767→    return { underlying, expiry, spot_price: Math.round(spot * 100) / 100, data };
+   768→  }
+   769→
+   770→  getPCR(underlying: string, expiry: string): {
+   771→    underlying: string;
+   772→    expiry: string;
+   773→    data: PCRPoint[];
+   774→    current_pcr: number;
+   775→    current_change_pcr: number;
+   776→  } {
+   777→    const history = this.pcrHistory[underlying] || [];
+   778→    const currentPcr = history.length > 0 ? history[history.length - 1].pcr : 1.0;
+   779→    const currentChange = history.length > 0 ? history[history.length - 1].change_pcr : 0;
+   780→
+   781→    return {
+   782→      underlying,
+   783→      expiry,
+   784→      data: history,
+   785→      current_pcr: Math.round(currentPcr * 1000) / 1000,
+   786→      current_change_pcr: Math.round(currentChange * 1000) / 1000,
+   787→    };
+   788→  }
+   789→
+   790→  get7StrikeMatrix(underlying: string, expiry: string): SevenStrikeMatrix {
+   791→    const config = UNDERLYING_CONFIG[underlying];
+   792→    if (!config) {
+   793→      return { underlying, expiry, spot_price: 0, atm_strike: 0, strike_step: 0, window_strikes: [], rows: [], ce_coi_sum: 0, pe_coi_sum: 0, coi_pcr: 1, state: 'IDLE' };
+   794→    }
+   795→
+   796→    const spot = this.getSpotPrice(underlying);
+   797→    const step = config.strikeStep;
+   798→    const atm = Math.round(spot / step) * step;
+   799→
+   800→    // 7-strike window: ATM ±3
+   801→    const windowStrikes: number[] = [];
+   802→    for (let i = -3; i <= 3; i++) {
+   803→      windowStrikes.push(atm + i * step);
+   804→    }
+   805→
+   806→    const rows: SevenStrikeRow[] = windowStrikes.map((strike) => {
+   807→      const oiInfo = this.oiData[underlying]?.[strike] || { ce_oi: 0, ce_change_oi: 0, pe_oi: 0, pe_change_oi: 0 };
+   808→      return {
+   809→        strike,
+   810→        ce_coi: oiInfo.ce_change_oi,
+   811→        pe_coi: oiInfo.pe_change_oi,
+   812→        ce_oi: oiInfo.ce_oi,
+   813→        pe_oi: oiInfo.pe_oi,
+   814→      };
+   815→    });
+   816→
+   817→    const ceCoiSum = rows.reduce((sum, r) => sum + r.ce_coi, 0);
+   818→    const peCoiSum = rows.reduce((sum, r) => sum + r.pe_coi, 0);
+   819→    const coiPcr = ceCoiSum !== 0 ? peCoiSum / ceCoiSum : 1;
+   820→
+   821→    // State determination
+   822→    let state = 'IDLE';
+   823→    if (coiPcr > 1.5 || coiPcr < 0.6) {
+   824→      state = 'ACTIVE';
+   825→    } else if (coiPcr > 1.2 || coiPcr < 0.8) {
+   826→      state = 'ZONE_WATCH';
+   827→    }
+   828→
+   829→    this.lastState[underlying] = state;
+   830→    this.lastPcr[underlying] = coiPcr;
+   831→
+   832→    return {
+   833→      underlying,
+   834→      expiry,
+   835→      spot_price: Math.round(spot * 100) / 100,
+   836→      atm_strike: atm,
+   837→      strike_step: step,
+   838→      window_strikes: windowStrikes,
+   839→      rows,
+   840→      ce_coi_sum: ceCoiSum,
+   841→      pe_coi_sum: peCoiSum,
+   842→      coi_pcr: Math.round(coiPcr * 1000) / 1000,
+   843→      state,
+   844→    };
+   845→  }
+   846→
+   847→  get7StrikeSignals(underlying: string, expiry: string): SevenStrikeSignals {
+   848→    const matrix = this.get7StrikeMatrix(underlying, expiry);
+   849→    const coiPcr = matrix.coi_pcr;
+   850→    const state = matrix.state;
+   851→
+   852→    // Generate signals based on COI PCR
+   853→    const signals = this.signalHistory[underlying] || [];
+   854→
+   855→    // Determine signal
+   856→    let signalType = 'NEUTRAL';
+   857→    let confidence = 0;
+   858→    let reason = 'No significant COI PCR divergence';
+   859→    let gateCondition: string | null = null;
+   860→    let volumePercent: number | null = null;
+   861→
+   862→    if (coiPcr > 1.5) {
+   863→      signalType = 'LONG';
+   864→      confidence = Math.min(0.95, 0.5 + (coiPcr - 1.5) * 0.3 + this.rng() * 0.1);
+   865→      reason = `Strong PE COI buildup (PCR: ${coiPcr.toFixed(3)}) suggests bearish resistance, bullish signal`;
+   866→      gateCondition = 'LONG';
+   867→      volumePercent = 75 + this.rng() * 20;
+   868→    } else if (coiPcr > 1.2) {
+   869→      signalType = 'LONG';
+   870→      confidence = Math.min(0.7, 0.3 + (coiPcr - 1.2) * 0.5 + this.rng() * 0.1);
+   871→      reason = `Moderate PE COI dominance (PCR: ${coiPcr.toFixed(3)}), watch for confirmation`;
+   872→      gateCondition = 'LONG';
+   873→    } else if (coiPcr < 0.6) {
+   874→      signalType = 'SHORT';
+   875→      confidence = Math.min(0.95, 0.5 + (0.6 - coiPcr) * 0.3 + this.rng() * 0.1);
+   876→      reason = `Strong CE COI buildup (PCR: ${coiPcr.toFixed(3)}) suggests bullish resistance, bearish signal`;
+   877→      gateCondition = 'SHORT';
+   878→      volumePercent = 75 + this.rng() * 20;
+   879→    } else if (coiPcr < 0.8) {
+   880→      signalType = 'SHORT';
+   881→      confidence = Math.min(0.7, 0.3 + (0.8 - coiPcr) * 0.5 + this.rng() * 0.1);
+   882→      reason = `Moderate CE COI dominance (PCR: ${coiPcr.toFixed(3)}), watch for confirmation`;
+   883→      gateCondition = 'SHORT';
+   884→    }
+   885→
+   886→    const currentSignal: Signal = {
+   887→      signal_type: signalType,
+   888→      confidence: Math.round(confidence * 1000) / 1000,
+   889→      reason,
+   890→      timestamp: Date.now(),
+   891→      spot_price: matrix.spot_price,
+   892→      coi_pcr: coiPcr,
+   893→      volume_percent: volumePercent,
+   894→      gate_condition: gateCondition,
+   895→      pain_index: coiPcr > 1 ? matrix.atm_strike + (coiPcr - 1) * 50 : matrix.atm_strike - (1 - coiPcr) * 50,
+   896→    };
+   897→
+   898→    // Add to history if different from last
+   899→    if (signals.length === 0 || signals[signals.length - 1].signal_type !== signalType) {
+   900→      signals.push(currentSignal);
+   901→      if (signals.length > 50) signals.shift();
+   902→      this.signalHistory[underlying] = signals;
+   903→    }
+   904→
+   905→    return {
+   906→      underlying,
+   907→      expiry,
+   908→      signals,
+   909→      current_signal: currentSignal,
+   910→      gate_condition: gateCondition || 'NONE',
+   911→      state,
+   912→    };
+   913→  }
+   914→
+   915→  searchInstruments(query: string): Instrument[] {
+   916→    const q = query.toUpperCase().trim();
+   917→    const results: Instrument[] = [];
+   918→
+   919→    // Parse human-readable query like "NIFTY 23900 CE 25 Jun 2026"
+   920→    // Extract: underlying, strike, optionType, expiry parts
+   921→    const parts = q.split(/\s+/);
+   922→    let searchUnderlying = '';
+   923→    let searchStrike: number | null = null;
+   924→    let searchOptionType = '';
+   925→    const monthNames = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+   926→
+   927→    for (const part of parts) {
+   928→      if (part === 'NIFTY' || part === 'NIFTY50') searchUnderlying = 'NIFTY';
+   929→      else if (part === 'BANKNIFTY' || part === 'BANK' || part === 'BNF') searchUnderlying = 'BANKNIFTY';
+   930→      else if (part === 'CE' || part === 'PE') searchOptionType = part;
+   931→      else if (/^\d{3,5}$/.test(part)) searchStrike = parseInt(part);
+   932→    }
+   933→
+   934→    // If no underlying detected, try to match from full query
+   935→    if (!searchUnderlying) {
+   936→      if (q.includes('NIFTY') && !q.includes('BANK')) searchUnderlying = 'NIFTY';
+   937→      else if (q.includes('BANKNIFTY') || q.includes('BNF')) searchUnderlying = 'BANKNIFTY';
+   938→    }
+   939→
+   940→    // Search across all expiries
+   941→    const expiries = nextThursdays(6);
+   942→
+   943→    for (const [symbol, config] of Object.entries(UNDERLYING_CONFIG)) {
+   944→      // If specific underlying requested, skip others
+   945→      if (searchUnderlying && symbol !== searchUnderlying) continue;
+   946→      // If no specific underlying, match by query containing symbol name
+   947→      if (!searchUnderlying && !q.includes(symbol) && !config.displayName.toUpperCase().includes(q)) continue;
+   948→
+   949→      // Add index
+   950→      results.push({
+   951→        instrument_key: `NSE_INDEX|${symbol}`,
+   952→        name: config.displayName,
+   953→        underlying: symbol,
+   954→        type: 'INDEX',
+   955→      });
+   956→
+   957→      // Add options for each expiry
+   958→      for (const expiryDate of expiries) {
+   959→        const expiry = formatExpiryDate(expiryDate);
+   960→        const expiryCompact = compactExpiry(expiry);
+   961→        const expiryLabel = formatDateLabel(expiryDate);
+   962→
+   963→        // Add futures
+   964→        results.push({
+   965→          instrument_key: `NSE_FO|${symbol}${expiryCompact}FUT`,
+   966→          name: `${symbol} ${expiryLabel} FUT`,
+   967→          underlying: symbol,
+   968→          type: 'FUT',
+   969→          expiry,
+   970→        });
+   971→
+   972→        // Options
+   973→        const spot = this.getSpotPrice(symbol);
+   974→        const step = config.strikeStep;
+   975→        const atm = Math.round(spot / step) * step;
+   976→        const range = searchStrike ? 3 : 5; // Narrower range if specific strike
+   977→        const baseStrike = searchStrike || atm;
+   978→
+   979→        for (let i = -range; i <= range; i++) {
+   980→          const strike = baseStrike + i * step;
+   981→          if (strike <= 0) continue;
+   982→          for (const optType of ['CE', 'PE'] as const) {
+   983→            // If specific option type requested, skip others
+   984→            if (searchOptionType && optType !== searchOptionType) continue;
+   985→
+   986→            const key = `NSE_FO|${symbol}${expiryCompact}${strike}${optType}`;
+   987→            results.push({
+   988→              instrument_key: key,
+   989→              name: `${symbol} ${strike} ${optType}`,
+   990→              underlying: symbol,
+   991→              type: optType,
+   992→              expiry,
+   993→              strike,
+   994→              display_name: `${symbol} ${strike} ${optType} ${expiryLabel}`,
+   995→            });
+   996→          }
+   997→        }
+   998→      }
+   999→    }
+  1000→
+  1001→    return results.slice(0, 30);
+  1002→  }
+  1003→
+  1004→  getExpiries(underlying: string): ExpiryInfo[] {
+  1005→    const thursdays = nextThursdays(6);
+  1006→    const now = new Date();
+  1007→    return thursdays.map((d) => {
+  1008→      const diffDays = Math.ceil((d.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+  1009→      return {
+  1010→        expiry_date: formatExpiryDate(d),
+  1011→        expiry_label: formatDateLabel(d),
+  1012→        is_weekly: true,
+  1013→        days_to_expiry: diffDays,
+  1014→      };
+  1015→    });
+  1016→  }
+  1017→
+  1018→  getReplaySessions(): Array<{
+  1019→    session_id: string;
+  1020→    underlying: string;
+  1021→    start_time: string;
+  1022→    end_time: string;
+  1023→    candle_count: number;
+  1024→  }> {
+  1025→    return [
+  1026→      {
+  1027→        session_id: 'demo-session-1',
+  1028→        underlying: 'NIFTY',
+  1029→        start_time: new Date(Date.now() - 3600000).toISOString(),
+  1030→        end_time: new Date().toISOString(),
+  1031→        candle_count: 60,
+  1032→      },
+  1033→      {
+  1034→        session_id: 'demo-session-2',
+  1035→        underlying: 'BANKNIFTY',
+  1036→        start_time: new Date(Date.now() - 7200000).toISOString(),
+  1037→        end_time: new Date(Date.now() - 3600000).toISOString(),
+  1038→        candle_count: 120,
+  1039→      },
+  1040→    ];
+  1041→  }
+  1042→
+  1043→  startReplay(sessionId: string): {
+  1044→    session_id: string;
+  1045→    status: string;
+  1046→    message: string;
+  1047→  } {
+  1048→    return {
+  1049→      session_id: sessionId,
+  1050→      status: 'started',
+  1051→      message: `Replay session ${sessionId} started. Data will be emitted via WebSocket.`,
+  1052→    };
+  1053→  }
+  1054→
+  1055→  getHealth(): {
+  1056→    status: string;
+  1057→    uptime: number;
+  1058→    symbols: string[];
+  1059→    tick_count: number;
+  1060→    timestamp: number;
+  1061→  } {
+  1062→    return {
+  1063→      status: 'ok',
+  1064→      uptime: process.uptime(),
+  1065→      symbols: Object.keys(UNDERLYING_CONFIG),
+  1066→      tick_count: this.tickCount,
+  1067→      timestamp: Date.now(),
+  1068→    };
+  1069→  }
+  1070→
+  1071→  private timeToExpiry(expiry: string): number {
+  1072→    try {
+  1073→      const expiryDate = new Date(expiry + 'T15:30:00+05:30');
+  1074→      const now = new Date();
+  1075→      const diffMs = expiryDate.getTime() - now.getTime();
+  1076→      const diffDays = diffMs / (1000 * 60 * 60 * 24);
+  1077→      return Math.max(diffDays / 365, 0.001); // in years, min 1 day
+  1078→    } catch {
+  1079→      return 7 / 365; // default ~1 week
+  1080→    }
+  1081→  }
+  1082→}
+  1083→
+  1084→// ============ Singleton Export ============
+  1085→
+  1086→let instance: MarketSimulator | null = null;
+  1087→
+  1088→export function getSimulator(): MarketSimulator {
+  1089→  if (!instance) {
+  1090→    instance = new MarketSimulator();
+  1091→  }
+  1092→  return instance;
+  1093→}
+  1094→

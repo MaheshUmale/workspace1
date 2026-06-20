@@ -1,0 +1,1555 @@
+     1→"""
+     2→Data Simulator — Realistic Indian Market Data Simulation Engine
+     3→===============================================================
+     4→Generates deterministic, realistic market data for NIFTY and BANKNIFTY
+     5→including spot prices (GBM), option chains (Black-Scholes), OI patterns,
+     6→7-Strike COI PCR matrix, signal generation, trade suggestions, volume
+     7→proxy, and trap cluster detection.
+     8→
+     9→Matches the TypeScript MarketSimulator functionality exactly.
+    10→"""
+    11→
+    12→import math
+    13→import time
+    14→import uuid
+    15→from datetime import datetime, timedelta
+    16→from typing import Any, Dict, List, Optional, Tuple
+    17→
+    18→from config import (
+    19→    RISK_FREE_RATE,
+    20→    UNDERLYING_CONFIG,
+    21→    TIMEFRAME_MAP,
+    22→)
+    23→
+    24→# ============ Seeded PRNG (Mulberry32) ============
+    25→
+    26→
+    27→def mulberry32(seed: int):
+    28→    """Deterministic pseudo-random number generator (Mulberry32).
+    29→    Returns a function that produces floats in [0, 1)."""
+    30→    s = seed & 0xFFFFFFFF
+    31→
+    32→    def _rng() -> float:
+    33→        nonlocal s
+    34→        s = (s + 0x6D2B79F5) & 0xFFFFFFFF
+    35→        t = s ^ (s >> 15)
+    36→        t = (t * (1 | s)) & 0xFFFFFFFF
+    37→        t = (t + (t * (61 | t) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    38→        t = t ^ (t >> 14)
+    39→        return (t & 0xFFFFFFFF) / 4294967296.0
+    40→
+    41→    return _rng
+    42→
+    43→
+    44→# ============ Normal distribution (Box-Muller) ============
+    45→
+    46→
+    47→def normal_random(rng, mean: float = 0.0, std: float = 1.0) -> float:
+    48→    """Generate a normally-distributed random number using Box-Muller transform."""
+    49→    u1 = rng()
+    50→    u2 = rng()
+    51→    z = math.sqrt(-2.0 * math.log(u1 if u1 > 0 else 1e-10)) * math.cos(
+    52→        2.0 * math.pi * u2
+    53→    )
+    54→    return z * std + mean
+    55→
+    56→
+    57→# ============ Cumulative Normal Distribution (Abramowitz & Stegun) ============
+    58→
+    59→
+    60→def cdf(x: float) -> float:
+    61→    """Standard normal cumulative distribution function.
+    62→    Uses the Abramowitz & Stegun approximation for speed."""
+    63→    a1 = 0.254829592
+    64→    a2 = -0.284496736
+    65→    a3 = 1.421413741
+    66→    a4 = -1.453152027
+    67→    a5 = 1.061405429
+    68→    p = 0.3275911
+    69→
+    70→    sign = -1.0 if x < 0 else 1.0
+    71→    x = abs(x) / math.sqrt(2.0)
+    72→
+    73→    t = 1.0 / (1.0 + p * x)
+    74→    y = 1.0 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * math.exp(
+    75→        -x * x
+    76→    )
+    77→    return 0.5 * (1.0 + sign * y)
+    78→
+    79→
+    80→def ndist(x: float) -> float:
+    81→    """Standard normal probability density function."""
+    82→    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+    83→
+    84→
+    85→# ============ Helper functions ============
+    86→
+    87→
+    88→def next_thursdays(count: int) -> List[datetime]:
+    89→    """Return the next `count` Thursdays from now (Indian weekly expiry)."""
+    90→    now = datetime.now()
+    91→    d = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    92→    # Advance to next Thursday (weekday 3)
+    93→    while d.weekday() != 3:
+    94→        d += timedelta(days=1)
+    95→    results = []
+    96→    for _ in range(count):
+    97→        results.append(d)
+    98→        d += timedelta(days=7)
+    99→    return results
+   100→
+   101→
+   102→def format_date_label(d: datetime) -> str:
+   103→    """Format a date as '25 Jun 2026'."""
+   104→    months = [
+   105→        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+   106→        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+   107→    ]
+   108→    return f"{d.day} {months[d.month - 1]} {d.year}"
+   109→
+   110→
+   111→def format_expiry_date(d: datetime) -> str:
+   112→    """Format a date as '2026-06-25'."""
+   113→    return f"{d.year}-{d.month:02d}-{d.day:02d}"
+   114→
+   115→
+   116→def compact_expiry(expiry_date: str) -> str:
+   117→    """Convert '2026-06-25' → '260625' for instrument key generation."""
+   118→    return expiry_date.replace("-", "")[2:]
+   119→
+   120→
+   121→def round2(value: float) -> float:
+   122→    """Round to 2 decimal places."""
+   123→    return round(value * 100) / 100
+   124→
+   125→
+   126→def round3(value: float) -> float:
+   127→    """Round to 3 decimal places."""
+   128→    return round(value * 1000) / 1000
+   129→
+   130→
+   131→def round4(value: float) -> float:
+   132→    """Round to 4 decimal places."""
+   133→    return round(value * 10000) / 10000
+   134→
+   135→
+   136→def round6(value: float) -> float:
+   137→    """Round to 6 decimal places."""
+   138→    return round(value * 1000000) / 1000000
+   139→
+   140→
+   141→# ============ Data Simulator Class ============
+   142→
+   143→
+   144→class DataSimulator:
+   145→    """
+   146→    Realistic Indian market data simulator.
+   147→
+   148→    Generates deterministic, realistic market data including:
+   149→    - Spot prices via Geometric Brownian Motion (GBM)
+   150→    - Option chain via Black-Scholes pricing with IV smile
+   151→    - Open Interest patterns with realistic ATM concentration
+   152→    - 7-Strike COI PCR matrix and signal generation
+   153→    - Trade suggestions with proper SL/target/R:R
+   154→    - Volume proxy with classification
+   155→    - Trap cluster detection
+   156→    - 120 pre-generated historical COI PCR data points
+   157→    """
+   158→
+   159→    def __init__(self):
+   160→        self.rng = mulberry32(42)
+   161→        self.spot_prices: Dict[str, float] = {}
+   162→        self.open_prices: Dict[str, float] = {}
+   163→        self.high_prices: Dict[str, float] = {}
+   164→        self.low_prices: Dict[str, float] = {}
+   165→        self.prev_close_prices: Dict[str, float] = {}
+   166→        self.volumes: Dict[str, int] = {}
+   167→        self.candles: Dict[str, list] = {}
+   168→        self.oi_data: Dict[str, Dict[int, Dict[str, int]]] = {}
+   169→        self.pcr_history: Dict[str, list] = {}
+   170→        self.tick_count: int = 0
+   171→        self.signal_history: Dict[str, list] = {}
+   172→        self.last_state: Dict[str, str] = {}
+   173→        self.last_pcr: Dict[str, float] = {}
+   174→
+   175→        # 7-Strike tracking state
+   176→        self.coi_pcr_history: Dict[str, list] = {}
+   177→        self.volume_proxy_history: Dict[str, list] = {}
+   178→        self.trap_clusters_data: Dict[str, list] = {}
+   179→        self.trade_suggestions: Dict[str, list] = {}
+   180→        self.last_atm_strike: Dict[str, int] = {}
+   181→        self.stabilization_until: Dict[str, int] = {}
+   182→        self.last_signal_type: Dict[str, str] = {}
+   183→        self.gate_condition_active: Dict[str, Optional[Dict[str, Any]]] = {}
+   184→
+   185→        # Initialize spot prices and basic state for each underlying
+   186→        for symbol, config in UNDERLYING_CONFIG.items():
+   187→            start_price = config["base_price"] + (self.rng() - 0.5) * config["base_price"] * 0.02
+   188→            self.spot_prices[symbol] = start_price
+   189→            self.open_prices[symbol] = start_price
+   190→            self.high_prices[symbol] = start_price * 1.005
+   191→            self.low_prices[symbol] = start_price * 0.995
+   192→            self.prev_close_prices[symbol] = start_price * (1 + (self.rng() - 0.5) * 0.01)
+   193→            self.volumes[symbol] = int(self.rng() * 5_000_000) + 1_000_000
+   194→            self.candles[symbol] = {}
+   195→            self.oi_data[symbol] = {}
+   196→            self.pcr_history[symbol] = []
+   197→            self.signal_history[symbol] = []
+   198→            self.last_state[symbol] = "IDLE"
+   199→            self.last_pcr[symbol] = 1.0
+   200→
+   201→        # Generate all historical data
+   202→        self._generate_historical_candles()
+   203→        self._generate_initial_oi()
+   204→        self._generate_initial_pcr()
+   205→        self._generate_7strike_history()
+   206→
+   207→    # ================================================================
+   208→    # Spot Price Generation — Geometric Brownian Motion
+   209→    # ================================================================
+   210→
+   211→    def _generate_tick(self, symbol: str) -> Dict[str, Any]:
+   212→        """Generate a new spot price tick using GBM."""
+   213→        config = UNDERLYING_CONFIG.get(symbol)
+   214→        if not config:
+   215→            raise ValueError(f"Unknown symbol: {symbol}")
+   216→
+   217→        prev_price = self.spot_prices[symbol]
+   218→        # GBM: dS = mu * S * dt + sigma * S * sqrt(dt) * Z
+   219→        mu = 0.0001  # small drift
+   220→        dt = 1.0 / 252.0 / 375.0  # ~1 tick in a trading day
+   221→        sigma = config["volatility"]
+   222→        z = normal_random(self.rng)
+   223→        dS = mu * prev_price * dt + sigma * prev_price * math.sqrt(dt) * z
+   224→        new_price = max(prev_price + dS, prev_price * 0.95)
+   225→
+   226→        self.spot_prices[symbol] = new_price
+   227→        self.high_prices[symbol] = max(self.high_prices[symbol], new_price)
+   228→        self.low_prices[symbol] = min(self.low_prices[symbol], new_price)
+   229→        self.volumes[symbol] += int(self.rng() * 5000) + 100
+   230→
+   231→        change = new_price - self.prev_close_prices[symbol]
+   232→        change_pct = (change / self.prev_close_prices[symbol]) * 100
+   233→        self.tick_count += 1
+   234→
+   235→        # Update OI every 5 ticks
+   236→        if self.tick_count % 5 == 0:
+   237→            self._update_oi(symbol)
+   238→
+   239→        return {
+   240→            "symbol": symbol,
+   241→            "ltp": round2(new_price),
+   242→            "change": round2(change),
+   243→            "change_pct": round2(change_pct),
+   244→            "open": round2(self.open_prices[symbol]),
+   245→            "high": round2(self.high_prices[symbol]),
+   246→            "low": round2(self.low_prices[symbol]),
+   247→            "close": round2(new_price),
+   248→            "volume": self.volumes[symbol],
+   249→            "timestamp": int(time.time() * 1000),
+   250→        }
+   251→
+   252→    def get_spot_price(self, symbol: str) -> float:
+   253→        """Get current spot price for a symbol."""
+   254→        return self.spot_prices.get(symbol, UNDERLYING_CONFIG.get(symbol, {}).get("base_price", 23500))
+   255→
+   256→    # ================================================================
+   257→    # Historical Candle Generation
+   258→    # ================================================================
+   259→
+   260→    def _generate_historical_candles(self):
+   261→        """Pre-generate 220 candles per symbol/timeframe combination."""
+   262→        now = int(time.time())
+   263→
+   264→        for symbol in UNDERLYING_CONFIG:
+   265→            config = UNDERLYING_CONFIG[symbol]
+   266→            for tf, tf_seconds in TIMEFRAME_MAP.items():
+   267→                key = f"{symbol}_{tf}"
+   268→                candle_list = []
+   269→                start_price = self.spot_prices[symbol]
+   270→                price = start_price * (1 + (self.rng() - 0.5) * 0.03)
+   271→
+   272→                # Separate deterministic RNG for candles
+   273→                seed = 1234 if symbol == "NIFTY" else 5678
+   274→                tf_offset = {"1m": 0, "3m": 1, "5m": 2, "15m": 3, "1h": 4}.get(tf, 0)
+   275→                candle_rng = mulberry32(seed + tf_offset)
+   276→
+   277→                num_candles = 220
+   278→                for i in range(num_candles, 0, -1):
+   279→                    t = now - i * tf_seconds
+   280→                    open_price = price
+   281→
+   282→                    # Simulate intra-candle movement
+   283→                    num_steps = {"1h": 60, "15m": 15, "5m": 5, "3m": 3}.get(tf, 1)
+   284→                    high = open_price
+   285→                    low = open_price
+   286→                    close = open_price
+   287→
+   288→                    for _ in range(num_steps):
+   289→                        mu = 0.00002
+   290→                        dt = 1.0 / 252.0 / 375.0
+   291→                        sigma = config["volatility"]
+   292→                        z = normal_random(candle_rng)
+   293→                        dS = mu * close * dt + sigma * close * math.sqrt(dt) * z
+   294→                        close = max(close + dS, close * 0.98)
+   295→                        high = max(high, close)
+   296→                        low = min(low, close)
+   297→
+   298→                    volume = (
+   299→                        int(candle_rng() * 200000)
+   300→                        + 50000
+   301→                        + int(math.sin(i / 20) * 30000)
+   302→                    )
+   303→
+   304→                    candle_list.append({
+   305→                        "time": t,
+   306→                        "open": round2(open_price),
+   307→                        "high": round2(high),
+   308→                        "low": round2(low),
+   309→                        "close": round2(close),
+   310→                        "volume": max(volume, 1000),
+   311→                    })
+   312→                    price = close
+   313→
+   314→                # Align last candle with current spot price
+   315→                if candle_list:
+   316→                    candle_list[-1]["close"] = round2(self.spot_prices[symbol])
+   317→
+   318→                self.candles[key] = candle_list
+   319→
+   320→    # ================================================================
+   321→    # Open Interest Generation
+   322→    # ================================================================
+   323→
+   324→    def _get_strikes(self, symbol: str, num_each_side: int) -> List[int]:
+   325→        """Get strike prices centered around ATM."""
+   326→        config = UNDERLYING_CONFIG.get(symbol, {})
+   327→        spot = self.spot_prices.get(symbol, 23500)
+   328→        step = config.get("strike_step", 50)
+   329→        atm = round(spot / step) * step
+   330→        strikes = []
+   331→        for i in range(-num_each_side, num_each_side + 1):
+   332→            strikes.append(atm + i * step)
+   333→        return strikes
+   334→
+   335→    def _generate_initial_oi(self):
+   336→        """Generate initial OI data with realistic patterns."""
+   337→        for symbol, config in UNDERLYING_CONFIG.items():
+   338→            spot = self.spot_prices[symbol]
+   339→            step = config["strike_step"]
+   340→            atm = round(spot / step) * step
+   341→            strikes = self._get_strikes(symbol, 10)
+   342→
+   343→            self.oi_data[symbol] = {}
+   344→            for strike in strikes:
+   345→                distance_from_atm = abs(strike - atm)
+   346→                round_bonus = (
+   347→                    1.5 if strike % 1000 == 0 else (1.2 if strike % 500 == 0 else 1.0)
+   348→                )
+   349→                base_oi = int(
+   350→                    (2_000_000 + self.rng() * 4_000_000)
+   351→                    * math.exp(-distance_from_atm / (step * 15))
+   352→                    * round_bonus
+   353→                )
+   354→
+   355→                ce_change_oi = int((self.rng() - 0.4) * 400_000)
+   356→                pe_change_oi = int((self.rng() - 0.4) * 400_000)
+   357→
+   358→                self.oi_data[symbol][strike] = {
+   359→                    "ce_oi": base_oi + int(self.rng() * 1_000_000),
+   360→                    "ce_change_oi": ce_change_oi,
+   361→                    "pe_oi": base_oi + int(self.rng() * 1_000_000),
+   362→                    "pe_change_oi": pe_change_oi,
+   363→                }
+   364→
+   365→    def _update_oi(self, symbol: str):
+   366→        """Update OI data with small random changes."""
+   367→        data = self.oi_data.get(symbol)
+   368→        if not data:
+   369→            return
+   370→        for strike_str in list(data.keys()):
+   371→            d = data[strike_str]
+   372→            d["ce_change_oi"] += int((self.rng() - 0.45) * 10_000)
+   373→            d["pe_change_oi"] += int((self.rng() - 0.45) * 10_000)
+   374→            d["ce_oi"] += int(self.rng() * 5_000)
+   375→            d["pe_oi"] += int(self.rng() * 5_000)
+   376→            # Clamp change OI to reasonable range
+   377→            d["ce_change_oi"] = max(-d["ce_oi"], min(d["ce_oi"], d["ce_change_oi"]))
+   378→            d["pe_change_oi"] = max(-d["pe_oi"], min(d["pe_oi"], d["pe_change_oi"]))
+   379→
+   380→    # ================================================================
+   381→    # PCR History Generation
+   382→    # ================================================================
+   383→
+   384→    def _generate_initial_pcr(self):
+   385→        """Generate 60 PCR history points at 1-minute intervals."""
+   386→        now_ms = int(time.time() * 1000)
+   387→        for symbol in UNDERLYING_CONFIG:
+   388→            pcr_points = []
+   389→            last_pcr = 0.9 + self.rng() * 0.3
+   390→            base_spot = self.spot_prices[symbol]
+   391→            spot = base_spot * (1 + (self.rng() - 0.5) * 0.01)
+   392→
+   393→            for i in range(60, 0, -1):
+   394→                timestamp = now_ms - i * 60_000
+   395→                spot += (self.rng() - 0.5) * base_spot * 0.001
+   396→                last_pcr += (self.rng() - 0.5) * 0.05
+   397→                last_pcr = max(0.3, min(2.5, last_pcr))
+   398→                change_pcr = (self.rng() - 0.5) * 0.1
+   399→
+   400→                pcr_points.append({
+   401→                    "timestamp": timestamp,
+   402→                    "spot": round2(spot),
+   403→                    "pcr": round3(last_pcr),
+   404→                    "change_pcr": round3(change_pcr),
+   405→                })
+   406→
+   407→            self.pcr_history[symbol] = pcr_points
+   408→            self.last_pcr[symbol] = last_pcr
+   409→
+   410→    # ================================================================
+   411→    # Black-Scholes Option Pricing
+   412→    # ================================================================
+   413→
+   414→    def _bs_price(
+   415→        self, S: float, K: float, T: float, sigma: float, opt_type: str
+   416→    ) -> Dict[str, float]:
+   417→        """Black-Scholes option pricing with Greeks.
+   418→
+   419→        Args:
+   420→            S: Spot price
+   421→            K: Strike price
+   422→            T: Time to expiry (in years)
+   423→            sigma: Implied volatility
+   424→            opt_type: 'CE' or 'PE'
+   425→
+   426→        Returns:
+   427→            Dict with price, delta, gamma, theta, vega
+   428→        """
+   429→        if T <= 0:
+   430→            intrinsic = max(S - K, 0) if opt_type == "CE" else max(K - S, 0)
+   431→            return {"price": intrinsic, "delta": 0, "gamma": 0, "theta": 0, "vega": 0}
+   432→
+   433→        r = RISK_FREE_RATE
+   434→        sqrtT = math.sqrt(T)
+   435→        d1 = (math.log(S / K) + (r + (sigma * sigma) / 2) * T) / (sigma * sqrtT)
+   436→        d2 = d1 - sigma * sqrtT
+   437→
+   438→        nd1 = cdf(d1)
+   439→        nd2 = cdf(d2)
+   440→        nnd1 = cdf(-d1)
+   441→        nnd2 = cdf(-d2)
+   442→        npd1 = ndist(d1)
+   443→
+   444→        if opt_type == "CE":
+   445→            price = S * nd1 - K * math.exp(-r * T) * nd2
+   446→            delta = nd1
+   447→        else:
+   448→            price = K * math.exp(-r * T) * nnd2 - S * nnd1
+   449→            delta = nd1 - 1
+   450→
+   451→        gamma = npd1 / (S * sigma * sqrtT)
+   452→        theta = (
+   453→            -(S * npd1 * sigma) / (2 * sqrtT)
+   454→            - (
+   455→                r * K * math.exp(-r * T) * nd2
+   456→                if opt_type == "CE"
+   457→                else -r * K * math.exp(-r * T) * nnd2
+   458→            )
+   459→        ) / 365
+   460→        vega = (S * npd1 * sqrtT) / 100
+   461→
+   462→        return {
+   463→            "price": max(price, 0.05),
+   464→            "delta": round4(delta),
+   465→            "gamma": round6(gamma),
+   466→            "theta": round2(theta),
+   467→            "vega": round2(vega),
+   468→        }
+   469→
+   470→    def _get_iv(self, strike: float, atm: float, base_iv: float) -> float:
+   471→        """Generate IV with smile shape.
+   472→
+   473→        IV smile: base + skew * distance² + tilt * (-moneyness) + noise
+   474→        """
+   475→        moneyness = (strike - atm) / atm
+   476→        skew = moneyness * moneyness * 2  # quadratic smile
+   477→        tilt = -moneyness * 0.05  # slight negative skew (put IV > call IV)
+   478→        return max(0.05, base_iv + skew + tilt + (self.rng() - 0.5) * 0.02)
+   479→
+   480→    def _time_to_expiry(self, expiry: str) -> float:
+   481→        """Calculate time to expiry in years from an expiry date string."""
+   482→        if not expiry:
+   483→            return 7.0 / 365.0
+   484→        try:
+   485→            expiry_dt = datetime.strptime(expiry, "%Y-%m-%d").replace(
+   486→                hour=15, minute=30
+   487→            )
+   488→            now = datetime.now()
+   489→            diff_days = (expiry_dt - now).total_seconds() / (24 * 3600)
+   490→            return max(diff_days / 365.0, 0.001)
+   491→        except (ValueError, TypeError):
+   492→            return 7.0 / 365.0
+   493→
+   494→    # ================================================================
+   495→    # Public API — Candles
+   496→    # ================================================================
+   497→
+   498→    def get_candles(self, instrument_key: str, timeframe: str) -> List[Dict]:
+   499→        """Get candle data for an instrument and timeframe.
+   500→
+   501→        instrument_key can be "NIFTY", "BANKNIFTY", or option key like
+   502→        "NSE_FO|NIFTY26062523500CE".
+   503→        """
+   504→        symbol = instrument_key
+   505→        if instrument_key.startswith("NSE_FO|"):
+   506→            parsed = self._parse_instrument_key_simple(instrument_key)
+   507→            if parsed:
+   508→                symbol = parsed["underlying"]
+   509→
+   510→        tf = timeframe if timeframe in TIMEFRAME_MAP else "1m"
+   511→        key = f"{symbol}_{tf}"
+   512→        return self.candles.get(key, [])
+   513→
+   514→    def _parse_instrument_key_simple(self, key: str) -> Optional[Dict]:
+   515→        """Parse an instrument key like 'NSE_FO|NIFTY26062523500CE'."""
+   516→        try:
+   517→            parts = key.split("|")
+   518→            if len(parts) < 2:
+   519→                return None
+   520→            body = parts[1]
+   521→
+   522→            underlying = ""
+   523→            rest = body
+   524→            if body.startswith("BANKNIFTY"):
+   525→                underlying = "BANKNIFTY"
+   526→                rest = body[9:]
+   527→            elif body.startswith("NIFTY"):
+   528→                underlying = "NIFTY"
+   529→                rest = body[5:]
+   530→            else:
+   531→                return None
+   532→
+   533→            option_type = ""
+   534→            if rest.endswith("CE"):
+   535→                option_type = "CE"
+   536→            elif rest.endswith("PE"):
+   537→                option_type = "PE"
+   538→            if not option_type:
+   539→                return None
+   540→            rest = rest[:-2]
+   541→
+   542→            # Extract strike from the end
+   543→            strike_str = ""
+   544→            while rest and rest[-1].isdigit():
+   545→                strike_str = rest[-1] + strike_str
+   546→                rest = rest[:-1]
+   547→            if not strike_str:
+   548→                return None
+   549→            strike = int(strike_str)
+   550→
+   551→            # Rest is expiry part
+   552→            expiry_part = rest
+   553→            if len(expiry_part) >= 6:
+   554→                year = 2000 + int(expiry_part[:2])
+   555→                month = int(expiry_part[2:4])
+   556→                day = int(expiry_part[4:6])
+   557→                expiry = f"{year}-{month:02d}-{day:02d}"
+   558→            else:
+   559→                expiry = ""
+   560→
+   561→            return {"underlying": underlying, "expiry": expiry, "strike": strike, "option_type": option_type}
+   562→        except Exception:
+   563→            return None
+   564→
+   565→    # ================================================================
+   566→    # Public API — Option Chain
+   567→    # ================================================================
+   568→
+   569→    def get_option_chain(self, underlying: str, expiry: str) -> Dict[str, Any]:
+   570→        """Fetch full option chain with Greeks for all strikes."""
+   571→        config = UNDERLYING_CONFIG.get(underlying)
+   572→        if not config:
+   573→            return {
+   574→                "underlying": underlying,
+   575→                "expiry": expiry,
+   576→                "spot_price": 0,
+   577→                "atm_strike": 0,
+   578→                "strike_step": 0,
+   579→                "chain": [],
+   580→            }
+   581→
+   582→        spot = self.get_spot_price(underlying)
+   583→        step = config["strike_step"]
+   584→        atm = round(spot / step) * step
+   585→        strikes = self._get_strikes(underlying, 10)
+   586→
+   587→        T = self._time_to_expiry(expiry)
+   588→        base_iv = config["volatility"]
+   589→
+   590→        chain = []
+   591→        for strike in strikes:
+   592→            iv = self._get_iv(strike, atm, base_iv)
+   593→            ce_greeks = self._bs_price(spot, strike, T, iv, "CE")
+   594→            pe_greeks = self._bs_price(spot, strike, T, iv, "PE")
+   595→            oi_info = self.oi_data.get(underlying, {}).get(
+   596→                strike,
+   597→                {"ce_oi": 0, "ce_change_oi": 0, "pe_oi": 0, "pe_change_oi": 0},
+   598→            )
+   599→
+   600→            spread = max(0.5, ce_greeks["price"] * 0.005)
+   601→            ce_expiry_compact = compact_expiry(expiry) if expiry else "260625"
+   602→
+   603→            chain.append({
+   604→                "strike": strike,
+   605→                "ce": {
+   606→                    "instrument_key": f"NSE_FO|{underlying}{ce_expiry_compact}{strike}CE",
+   607→                    "ltp": round2(ce_greeks["price"]),
+   608→                    "oi": oi_info["ce_oi"],
+   609→                    "change_oi": oi_info["ce_change_oi"],
+   610→                    "volume": int(self.rng() * 100_000) + 10_000,
+   611→                    "iv": round2(iv),
+   612→                    "delta": ce_greeks["delta"],
+   613→                    "gamma": ce_greeks["gamma"],
+   614→                    "theta": ce_greeks["theta"],
+   615→                    "vega": ce_greeks["vega"],
+   616→                    "bid_price": round2(ce_greeks["price"] - spread / 2),
+   617→                    "ask_price": round2(ce_greeks["price"] + spread / 2),
+   618→                },
+   619→                "pe": {
+   620→                    "instrument_key": f"NSE_FO|{underlying}{ce_expiry_compact}{strike}PE",
+   621→                    "ltp": round2(pe_greeks["price"]),
+   622→                    "oi": oi_info["pe_oi"],
+   623→                    "change_oi": oi_info["pe_change_oi"],
+   624→                    "volume": int(self.rng() * 100_000) + 10_000,
+   625→                    "iv": round2(iv),
+   626→                    "delta": pe_greeks["delta"],
+   627→                    "gamma": pe_greeks["gamma"],
+   628→                    "theta": pe_greeks["theta"],
+   629→                    "vega": pe_greeks["vega"],
+   630→                    "bid_price": round2(pe_greeks["price"] - spread / 2),
+   631→                    "ask_price": round2(pe_greeks["price"] + spread / 2),
+   632→                },
+   633→            })
+   634→
+   635→        return {
+   636→            "underlying": underlying,
+   637→            "expiry": expiry,
+   638→            "spot_price": round2(spot),
+   639→            "atm_strike": atm,
+   640→            "strike_step": step,
+   641→            "chain": chain,
+   642→        }
+   643→
+   644→    def get_mini_option_chain(self, underlying: str, expiry: str) -> Dict[str, Any]:
+   645→        """Fetch compact option chain (no gamma/theta/vega) for bottom panel."""
+   646→        full = self.get_option_chain(underlying, expiry)
+   647→        mini_chain = []
+   648→        for row in full["chain"]:
+   649→            mini_chain.append({
+   650→                "strike": row["strike"],
+   651→                "ce": {
+   652→                    "instrument_key": row["ce"]["instrument_key"],
+   653→                    "ltp": row["ce"]["ltp"],
+   654→                    "oi": row["ce"]["oi"],
+   655→                    "change_oi": row["ce"]["change_oi"],
+   656→                    "volume": row["ce"]["volume"],
+   657→                    "iv": row["ce"]["iv"],
+   658→                    "delta": row["ce"]["delta"],
+   659→                    "bid_price": row["ce"]["bid_price"],
+   660→                    "ask_price": row["ce"]["ask_price"],
+   661→                },
+   662→                "pe": {
+   663→                    "instrument_key": row["pe"]["instrument_key"],
+   664→                    "ltp": row["pe"]["ltp"],
+   665→                    "oi": row["pe"]["oi"],
+   666→                    "change_oi": row["pe"]["change_oi"],
+   667→                    "volume": row["pe"]["volume"],
+   668→                    "iv": row["pe"]["iv"],
+   669→                    "delta": row["pe"]["delta"],
+   670→                    "bid_price": row["pe"]["bid_price"],
+   671→                    "ask_price": row["pe"]["ask_price"],
+   672→                },
+   673→            })
+   674→
+   675→        return {
+   676→            "underlying": full["underlying"],
+   677→            "expiry": full["expiry"],
+   678→            "spot_price": full["spot_price"],
+   679→            "atm_strike": full["atm_strike"],
+   680→            "strike_step": full["strike_step"],
+   681→            "chain": mini_chain,
+   682→        }
+   683→
+   684→    # ================================================================
+   685→    # Public API — OI Data
+   686→    # ================================================================
+   687→
+   688→    def get_oi_data(self, underlying: str, expiry: str) -> Dict[str, Any]:
+   689→        """Get OI data across strikes."""
+   690→        config = UNDERLYING_CONFIG.get(underlying)
+   691→        if not config:
+   692→            return {"underlying": underlying, "expiry": expiry, "spot_price": 0, "data": []}
+   693→
+   694→        spot = self.get_spot_price(underlying)
+   695→        strikes = self._get_strikes(underlying, 10)
+   696→
+   697→        data = []
+   698→        for strike in strikes:
+   699→            oi_info = self.oi_data.get(underlying, {}).get(
+   700→                strike,
+   701→                {"ce_oi": 0, "ce_change_oi": 0, "pe_oi": 0, "pe_change_oi": 0},
+   702→            )
+   703→            data.append({
+   704→                "timestamp": int(time.time() * 1000),
+   705→                "strike": strike,
+   706→                "ce_oi": oi_info["ce_oi"],
+   707→                "ce_change_oi": oi_info["ce_change_oi"],
+   708→                "pe_oi": oi_info["pe_oi"],
+   709→                "pe_change_oi": oi_info["pe_change_oi"],
+   710→            })
+   711→
+   712→        return {"underlying": underlying, "expiry": expiry, "spot_price": round2(spot), "data": data}
+   713→
+   714→    # ================================================================
+   715→    # Public API — PCR
+   716→    # ================================================================
+   717→
+   718→    def get_pcr(self, underlying: str, expiry: str) -> Dict[str, Any]:
+   719→        """Get PCR history and current values."""
+   720→        history = self.pcr_history.get(underlying, [])
+   721→        current_pcr = history[-1]["pcr"] if history else 1.0
+   722→        current_change = history[-1]["change_pcr"] if history else 0
+   723→
+   724→        return {
+   725→            "underlying": underlying,
+   726→            "expiry": expiry,
+   727→            "data": history,
+   728→            "current_pcr": round3(current_pcr),
+   729→            "current_change_pcr": round3(current_change),
+   730→        }
+   731→
+   732→    # ================================================================
+   733→    # Public API — Expiries
+   734→    # ================================================================
+   735→
+   736→    def get_expiries(self, underlying: str) -> List[Dict[str, Any]]:
+   737→        """Get upcoming weekly expiry dates (next 6 Thursdays)."""
+   738→        thursdays = next_thursdays(6)
+   739→        now = datetime.now()
+   740→        return [
+   741→            {
+   742→                "expiry_date": format_expiry_date(d),
+   743→                "expiry_label": format_date_label(d),
+   744→                "is_weekly": True,
+   745→                "days_to_expiry": (d - now).days,
+   746→            }
+   747→            for d in thursdays
+   748→        ]
+   749→
+   750→    # ================================================================
+   751→    # Public API — Instrument Search
+   752→    # ================================================================
+   753→
+   754→    def search_instruments(self, query: str) -> List[Dict[str, Any]]:
+   755→        """Search for instruments matching a query string.
+   756→
+   757→        Supports human-readable queries like 'NIFTY 23900 CE 25 Jun 2026'.
+   758→        """
+   759→        q = query.upper().strip()
+   760→        results = []
+   761→
+   762→        parts = q.split()
+   763→        search_underlying = ""
+   764→        search_strike = None
+   765→        search_option_type = ""
+   766→
+   767→        for part in parts:
+   768→            if part in ("NIFTY", "NIFTY50"):
+   769→                search_underlying = "NIFTY"
+   770→            elif part in ("BANKNIFTY", "BANK", "BNF"):
+   771→                search_underlying = "BANKNIFTY"
+   772→            elif part in ("CE", "PE"):
+   773→                search_option_type = part
+   774→            elif part.isdigit() and 3 <= len(part) <= 5:
+   775→                search_strike = int(part)
+   776→
+   777→        # Fallback: detect underlying from full query
+   778→        if not search_underlying:
+   779→            if "NIFTY" in q and "BANK" not in q:
+   780→                search_underlying = "NIFTY"
+   781→            elif "BANKNIFTY" in q or "BNF" in q:
+   782→                search_underlying = "BANKNIFTY"
+   783→
+   784→        expiries = next_thursdays(6)
+   785→
+   786→        for symbol, config in UNDERLYING_CONFIG.items():
+   787→            if search_underlying and symbol != search_underlying:
+   788→                continue
+   789→            if not search_underlying and symbol not in q and config["display_name"].upper() not in q:
+   790→                continue
+   791→
+   792→            # Add index
+   793→            results.append({
+   794→                "instrument_key": f"NSE_INDEX|{symbol}",
+   795→                "name": config["display_name"],
+   796→                "underlying": symbol,
+   797→                "type": "INDEX",
+   798→            })
+   799→
+   800→            # Add options for each expiry
+   801→            for expiry_date in expiries:
+   802→                expiry = format_expiry_date(expiry_date)
+   803→                expiry_compact = compact_expiry(expiry)
+   804→                expiry_label = format_date_label(expiry_date)
+   805→
+   806→                # Add futures
+   807→                results.append({
+   808→                    "instrument_key": f"NSE_FO|{symbol}{expiry_compact}FUT",
+   809→                    "name": f"{symbol} {expiry_label} FUT",
+   810→                    "underlying": symbol,
+   811→                    "type": "FUT",
+   812→                    "expiry": expiry,
+   813→                })
+   814→
+   815→                # Add options
+   816→                spot = self.get_spot_price(symbol)
+   817→                step = config["strike_step"]
+   818→                atm = round(spot / step) * step
+   819→                range_val = 3 if search_strike else 5
+   820→                base_strike = search_strike or atm
+   821→
+   822→                for i in range(-range_val, range_val + 1):
+   823→                    strike = base_strike + i * step
+   824→                    if strike <= 0:
+   825→                        continue
+   826→                    for opt_type in ["CE", "PE"]:
+   827→                        if search_option_type and opt_type != search_option_type:
+   828→                            continue
+   829→
+   830→                        results.append({
+   831→                            "instrument_key": f"NSE_FO|{symbol}{expiry_compact}{strike}{opt_type}",
+   832→                            "name": f"{symbol} {strike} {opt_type}",
+   833→                            "underlying": symbol,
+   834→                            "type": opt_type,
+   835→                            "expiry": expiry,
+   836→                            "strike": strike,
+   837→                            "display_name": f"{symbol} {strike} {opt_type} {expiry_label}",
+   838→                        })
+   839→
+   840→        return results[:30]
+   841→
+   842→    # ================================================================
+   843→    # 7-Strike COI PCR Matrix
+   844→    # ================================================================
+   845→
+   846→    def get_7strike_matrix(self, underlying: str, expiry: str) -> Dict[str, Any]:
+   847→        """Compute the 7-Strike COI PCR Matrix.
+   848→
+   849→        Window: ATM ± 3 strikes
+   850→        COI PCR = Sum(PE Change OI) / Sum(CE Change OI) for the 7-strike window
+   851→        """
+   852→        config = UNDERLYING_CONFIG.get(underlying)
+   853→        if not config:
+   854→            return {
+   855→                "underlying": underlying,
+   856→                "expiry": expiry,
+   857→                "spot_price": 0,
+   858→                "atm_strike": 0,
+   859→                "strike_step": 0,
+   860→                "window_strikes": [],
+   861→                "rows": [],
+   862→                "ce_coi_sum": 0,
+   863→                "pe_coi_sum": 0,
+   864→                "coi_pcr": 1.0,
+   865→                "state": "IDLE",
+   866→            }
+   867→
+   868→        spot = self.get_spot_price(underlying)
+   869→        step = config["strike_step"]
+   870→        atm = round(spot / step) * step
+   871→
+   872→        # 7-strike window: ATM ± 3
+   873→        window_strikes = [atm + i * step for i in range(-3, 4)]
+   874→
+   875→        rows = []
+   876→        for strike in window_strikes:
+   877→            oi_info = self.oi_data.get(underlying, {}).get(
+   878→                strike,
+   879→                {"ce_oi": 0, "ce_change_oi": 0, "pe_oi": 0, "pe_change_oi": 0},
+   880→            )
+   881→            rows.append({
+   882→                "strike": strike,
+   883→                "ce_coi": oi_info["ce_change_oi"],
+   884→                "pe_coi": oi_info["pe_change_oi"],
+   885→                "ce_oi": oi_info["ce_oi"],
+   886→                "pe_oi": oi_info["pe_oi"],
+   887→            })
+   888→
+   889→        ce_coi_sum = sum(r["ce_coi"] for r in rows)
+   890→        pe_coi_sum = sum(r["pe_coi"] for r in rows)
+   891→        coi_pcr = pe_coi_sum / ce_coi_sum if ce_coi_sum != 0 else 1.0
+   892→
+   893→        # State determination
+   894→        state = "IDLE"
+   895→        if coi_pcr > 1.5 or coi_pcr < 0.6:
+   896→            state = "ACTIVE"
+   897→        elif coi_pcr > 1.2 or coi_pcr < 0.8:
+   898→            state = "ZONE_WATCH"
+   899→
+   900→        self.last_state[underlying] = state
+   901→        self.last_pcr[underlying] = coi_pcr
+   902→
+   903→        return {
+   904→            "underlying": underlying,
+   905→            "expiry": expiry,
+   906→            "spot_price": round2(spot),
+   907→            "atm_strike": atm,
+   908→            "strike_step": step,
+   909→            "window_strikes": window_strikes,
+   910→            "rows": rows,
+   911→            "ce_coi_sum": ce_coi_sum,
+   912→            "pe_coi_sum": pe_coi_sum,
+   913→            "coi_pcr": round3(coi_pcr),
+   914→            "state": state,
+   915→        }
+   916→
+   917→    # ================================================================
+   918→    # 7-Strike Signals
+   919→    # ================================================================
+   920→
+   921→    def get_7strike_signals(self, underlying: str, expiry: str) -> Dict[str, Any]:
+   922→        """Generate trading signals based on 7-Strike COI PCR.
+   923→
+   924→        Signal thresholds:
+   925→        - PCR > 1.5 → LONG (high confidence)
+   926→        - PCR > 1.2 → LONG (moderate confidence)
+   927→        - PCR < 0.6 → SHORT (high confidence)
+   928→        - PCR < 0.8 → SHORT (moderate confidence)
+   929→        - Otherwise → NEUTRAL
+   930→        """
+   931→        matrix = self.get_7strike_matrix(underlying, expiry)
+   932→        coi_pcr = matrix["coi_pcr"]
+   933→        state = matrix["state"]
+   934→
+   935→        signals = self.signal_history.get(underlying, [])
+   936→
+   937→        # Determine signal
+   938→        signal_type = "NEUTRAL"
+   939→        confidence = 0.0
+   940→        reason = "No significant COI PCR divergence"
+   941→        gate_condition = None
+   942→        volume_percent = None
+   943→
+   944→        if coi_pcr > 1.5:
+   945→            signal_type = "LONG"
+   946→            confidence = min(0.95, 0.5 + (coi_pcr - 1.5) * 0.3 + self.rng() * 0.1)
+   947→            reason = f"Strong PE COI buildup (PCR: {coi_pcr:.3f}) suggests bearish resistance, bullish signal"
+   948→            gate_condition = "LONG"
+   949→            volume_percent = 75 + self.rng() * 20
+   950→        elif coi_pcr > 1.2:
+   951→            signal_type = "LONG"
+   952→            confidence = min(0.7, 0.3 + (coi_pcr - 1.2) * 0.5 + self.rng() * 0.1)
+   953→            reason = f"Moderate PE COI dominance (PCR: {coi_pcr:.3f}), watch for confirmation"
+   954→            gate_condition = "LONG"
+   955→        elif coi_pcr < 0.6:
+   956→            signal_type = "SHORT"
+   957→            confidence = min(0.95, 0.5 + (0.6 - coi_pcr) * 0.3 + self.rng() * 0.1)
+   958→            reason = f"Strong CE COI buildup (PCR: {coi_pcr:.3f}) suggests bullish resistance, bearish signal"
+   959→            gate_condition = "SHORT"
+   960→            volume_percent = 75 + self.rng() * 20
+   961→        elif coi_pcr < 0.8:
+   962→            signal_type = "SHORT"
+   963→            confidence = min(0.7, 0.3 + (0.8 - coi_pcr) * 0.5 + self.rng() * 0.1)
+   964→            reason = f"Moderate CE COI dominance (PCR: {coi_pcr:.3f}), watch for confirmation"
+   965→            gate_condition = "SHORT"
+   966→
+   967→        current_signal = {
+   968→            "signal_type": signal_type,
+   969→            "confidence": round3(confidence),
+   970→            "reason": reason,
+   971→            "timestamp": int(time.time() * 1000),
+   972→            "spot_price": matrix["spot_price"],
+   973→            "coi_pcr": coi_pcr,
+   974→            "volume_percent": round2(volume_percent) if volume_percent is not None else None,
+   975→            "gate_condition": gate_condition,
+   976→            "pain_index": (
+   977→                matrix["atm_strike"] + (coi_pcr - 1) * 50
+   978→                if coi_pcr > 1
+   979→                else matrix["atm_strike"] - (1 - coi_pcr) * 50
+   980→            ),
+   981→        }
+   982→
+   983→        # Add to history if signal type changed
+   984→        if not signals or signals[-1]["signal_type"] != signal_type:
+   985→            signals.append(current_signal)
+   986→            if len(signals) > 50:
+   987→                signals.pop(0)
+   988→            self.signal_history[underlying] = signals
+   989→
+   990→        return {
+   991→            "underlying": underlying,
+   992→            "expiry": expiry,
+   993→            "signals": signals,
+   994→            "current_signal": current_signal,
+   995→            "gate_condition": gate_condition or "NONE",
+   996→            "state": state,
+   997→        }
+   998→
+   999→    # ================================================================
+  1000→    # 7-Strike History — Pre-generation (120 data points)
+  1001→    # ================================================================
+  1002→
+  1003→    def _generate_7strike_history(self):
+  1004→        """Pre-generate 120 historical COI PCR data points.
+  1005→
+  1006→        Simulates 2 hours of 1-minute interval data for each underlying.
+  1007→        Uses separate deterministic PRNG for reproducibility.
+  1008→        """
+  1009→        now_ms = int(time.time() * 1000)
+  1010→
+  1011→        for symbol, config in UNDERLYING_CONFIG.items():
+  1012→            step = config["strike_step"]
+  1013→            base_spot = self.spot_prices[symbol]
+  1014→
+  1015→            # Initialize arrays
+  1016→            self.coi_pcr_history[symbol] = []
+  1017→            self.volume_proxy_history[symbol] = []
+  1018→            self.trap_clusters_data[symbol] = []
+  1019→            self.trade_suggestions[symbol] = []
+  1020→            self.last_atm_strike[symbol] = round(base_spot / step) * step
+  1021→            self.stabilization_until[symbol] = 0
+  1022→            self.last_signal_type[symbol] = "NEUTRAL"
+  1023→            self.gate_condition_active[symbol] = None
+  1024→
+  1025→            # Separate deterministic RNG for history
+  1026→            hist_rng = mulberry32(9876 if symbol == "NIFTY" else 5432)
+  1027→            spot = base_spot * (1 + (hist_rng() - 0.5) * 0.005)
+  1028→            last_pcr = 0.9 + hist_rng() * 0.3
+  1029→            last_signal = "NEUTRAL"
+  1030→            gate_active = None
+  1031→            prev_atm = round(spot / step) * step
+  1032→
+  1033→            for i in range(120, 0, -1):
+  1034→                timestamp = now_ms - i * 60_000  # 1-minute intervals
+  1035→
+  1036→                # Simulate spot movement
+  1037→                spot += (hist_rng() - 0.5) * base_spot * 0.001
+  1038→                current_atm = round(spot / step) * step
+  1039→
+  1040→                # Check for ATM shift
+  1041→                if current_atm != prev_atm:
+  1042→                    self.stabilization_until[symbol] = timestamp + 120_000  # 2-min stabilization
+  1043→
+  1044→                # Generate COI PCR values
+  1045→                ce_coi_base = int((hist_rng() - 0.4) * 400_000)
+  1046→                pe_coi_base = int((hist_rng() - 0.4) * 400_000)
+  1047→                ce_coi_sum = ce_coi_base + int(hist_rng() * 200_000)
+  1048→                pe_coi_sum = pe_coi_base + int(hist_rng() * 200_000)
+  1049→
+  1050→                last_pcr += (hist_rng() - 0.5) * 0.04
+  1051→                last_pcr = max(0.3, min(2.5, last_pcr))
+  1052→                coi_pcr = pe_coi_sum / ce_coi_sum if ce_coi_sum != 0 else 1.0
+  1053→
+  1054→                # Determine state
+  1055→                state = "IDLE"
+  1056→                if coi_pcr > 1.5 or coi_pcr < 0.6:
+  1057→                    state = "ACTIVE"
+  1058→                elif coi_pcr > 1.2 or coi_pcr < 0.8:
+  1059→                    state = "ZONE_WATCH"
+  1060→
+  1061→                # Determine signal type
+  1062→                signal_type = "NEUTRAL"
+  1063→                confidence = 0.0
+  1064→                if coi_pcr > 1.5:
+  1065→                    signal_type = "LONG"
+  1066→                    confidence = min(0.95, 0.5 + (coi_pcr - 1.5) * 0.3 + hist_rng() * 0.1)
+  1067→                elif coi_pcr > 1.2:
+  1068→                    signal_type = "LONG"
+  1069→                    confidence = min(0.7, 0.3 + (coi_pcr - 1.2) * 0.5 + hist_rng() * 0.1)
+  1070→                elif coi_pcr < 0.6:
+  1071→                    signal_type = "SHORT"
+  1072→                    confidence = min(0.95, 0.5 + (0.6 - coi_pcr) * 0.3 + hist_rng() * 0.1)
+  1073→                elif coi_pcr < 0.8:
+  1074→                    signal_type = "SHORT"
+  1075→                    confidence = min(0.7, 0.3 + (0.8 - coi_pcr) * 0.5 + hist_rng() * 0.1)
+  1076→
+  1077→                # Track gate condition
+  1078→                if signal_type in ("LONG", "SHORT"):
+  1079→                    if not gate_active or gate_active["type"] != signal_type:
+  1080→                        gate_active = {"type": signal_type, "since": timestamp}
+  1081→                else:
+  1082→                    gate_active = None
+  1083→
+  1084→                # Add COI PCR point
+  1085→                self.coi_pcr_history[symbol].append({
+  1086→                    "timestamp": timestamp,
+  1087→                    "coi_pcr": round3(coi_pcr),
+  1088→                    "spot": round2(spot),
+  1089→                    "ce_coi_sum": ce_coi_sum,
+  1090→                    "pe_coi_sum": pe_coi_sum,
+  1091→                    "state": state,
+  1092→                    "signal_type": signal_type,
+  1093→                    "confidence": round3(confidence),
+  1094→                })
+  1095→
+  1096→                # Generate volume proxy
+  1097→                volume_percent = 0.5 + hist_rng() * 3
+  1098→                if hist_rng() < 0.05:
+  1099→                    volume_percent = 5 + hist_rng() * 3  # spike
+  1100→
+  1101→                if volume_percent >= 5:
+  1102→                    classification = "EXTREME"
+  1103→                elif volume_percent >= 3:
+  1104→                    classification = "HIGH"
+  1105→                elif volume_percent >= 1.5:
+  1106→                    classification = "ELEVATED"
+  1107→                else:
+  1108→                    classification = "NORMAL"
+  1109→
+  1110→                self.volume_proxy_history[symbol].append({
+  1111→                    "timestamp": timestamp,
+  1112→                    "volume_percent": round2(volume_percent),
+  1113→                    "classification": classification,
+  1114→                    "spot": round2(spot),
+  1115→                })
+  1116→
+  1117→                # Check for trap clusters when volume is HIGH or EXTREME
+  1118→                if volume_percent >= 3.0:
+  1119→                    if signal_type == "LONG":
+  1120→                        direction = "BEARISH_TRAP"
+  1121→                    elif signal_type == "SHORT":
+  1122→                        direction = "BULLISH_TRAP"
+  1123→                    else:
+  1124→                        direction = "BULLISH_TRAP" if hist_rng() > 0.5 else "BEARISH_TRAP"
+  1125→
+  1126→                    pain_index = (
+  1127→                        current_atm + int(hist_rng() * 4) * step
+  1128→                        if direction == "BULLISH_TRAP"
+  1129→                        else current_atm - int(hist_rng() * 4) * step
+  1130→                    )
+  1131→
+  1132→                    self.trap_clusters_data[symbol].append({
+  1133→                        "id": f"trap_{symbol}_{timestamp}",
+  1134→                        "price_high": current_atm + step,
+  1135→                        "price_low": current_atm - step,
+  1136→                        "timestamp_start": timestamp,
+  1137→                        "volume_trapped": int(volume_percent * 100_000),
+  1138→                        "direction": direction,
+  1139→                        "pain_index": pain_index,
+  1140→                        "active": i <= 5,  # Only last 5 are still active
+  1141→                        "triggered": i > 5,
+  1142→                    })
+  1143→
+  1144→                # Generate trade suggestions for significant signals
+  1145→                if (signal_type in ("LONG", "SHORT")) and confidence > 0.6 and i % 15 == 0:
+  1146→                    lot_size = 15 if symbol == "BANKNIFTY" else 25
+  1147→                    entry_strike = current_atm
+  1148→
+  1149→                    sl_pct = 0.30 if confidence > 0.8 else 0.40
+  1150→                    target_pct = 1.50 if confidence > 0.8 else 1.00
+  1151→
+  1152→                    T = 7.0 / 365.0
+  1153→                    iv = config["volatility"]
+  1154→
+  1155→                    if signal_type == "LONG":
+  1156→                        greeks = self._bs_price(spot, entry_strike, T, iv, "CE")
+  1157→                        entry_price = round2(greeks["price"])
+  1158→                        stop_loss = max(0.05, round2(entry_price * (1 - sl_pct)))
+  1159→                        target = round2(entry_price * (1 + target_pct))
+  1160→                        option_suggestion = f"BUY {symbol} {entry_strike} CE (Lot: {lot_size})"
+  1161→                    else:
+  1162→                        greeks = self._bs_price(spot, entry_strike, T, iv, "PE")
+  1163→                        entry_price = round2(greeks["price"])
+  1164→                        stop_loss = max(0.05, round2(entry_price * (1 - sl_pct)))
+  1165→                        target = round2(entry_price * (1 + target_pct))
+  1166→                        option_suggestion = f"BUY {symbol} {entry_strike} PE (Lot: {lot_size})"
+  1167→
+  1168→                    risk = entry_price - stop_loss
+  1169→                    reward = target - entry_price
+  1170→                    rr_ratio = f"{reward / risk:.1f}" if risk > 0 else "0.0"
+  1171→
+  1172→                    self.trade_suggestions[symbol].append({
+  1173→                        "id": f"trade_{symbol}_{timestamp}",
+  1174→                        "signal_type": signal_type,
+  1175→                        "entry_price": entry_price,
+  1176→                        "stop_loss": stop_loss,
+  1177→                        "target": target,
+  1178→                        "risk_reward": f"1:{rr_ratio}",
+  1179→                        "confidence": round3(confidence),
+  1180→                        "reason": (
+  1181→                            f"Strong PE COI buildup (PCR: {coi_pcr:.3f}) — bullish signal"
+  1182→                            if signal_type == "LONG"
+  1183→                            else f"Strong CE COI buildup (PCR: {coi_pcr:.3f}) — bearish signal"
+  1184→                        ),
+  1185→                        "timestamp": timestamp,
+  1186→                        "spot_price": round2(spot),
+  1187→                        "coi_pcr": round3(coi_pcr),
+  1188→                        "status": "HIT_TARGET" if i > 10 else "ACTIVE",
+  1189→                        "option_suggestion": option_suggestion,
+  1190→                        "exit_reason": "Target achieved" if i > 10 else None,
+  1191→                    })
+  1192→
+  1193→                last_signal = signal_type
+  1194→
+  1195→            self.last_atm_strike[symbol] = prev_atm
+  1196→            self.last_signal_type[symbol] = last_signal
+  1197→            self.gate_condition_active[symbol] = gate_active
+  1198→
+  1199→    # ================================================================
+  1200→    # 7-Strike COI PCR History — Live Update
+  1201→    # ================================================================
+  1202→
+  1203→    def _update_coi_pcr_history(self, underlying: str):
+  1204→        """Update COI PCR history with current data point.
+  1205→
+  1206→        Detects ATM shifts and adds 2-minute stabilization periods.
+  1207→        Tracks gate condition state.
+  1208→        """
+  1209→        config = UNDERLYING_CONFIG.get(underlying)
+  1210→        if not config:
+  1211→            return
+  1212→
+  1213→        matrix = self.get_7strike_matrix(underlying, "")
+  1214→        spot = matrix["spot_price"]
+  1215→        current_atm = matrix["atm_strike"]
+  1216→
+  1217→        # Check for ATM shift
+  1218→        prev_atm = self.last_atm_strike.get(underlying, current_atm)
+  1219→        if current_atm != prev_atm:
+  1220→            self.stabilization_until[underlying] = int(time.time() * 1000) + 120_000
+  1221→            self.last_atm_strike[underlying] = current_atm
+  1222→
+  1223→        # Determine signal from current matrix
+  1224→        coi_pcr = matrix["coi_pcr"]
+  1225→        signal_type = "NEUTRAL"
+  1226→        confidence = 0.0
+  1227→        if coi_pcr > 1.5:
+  1228→            signal_type = "LONG"
+  1229→            confidence = min(0.95, 0.5 + (coi_pcr - 1.5) * 0.3 + self.rng() * 0.1)
+  1230→        elif coi_pcr > 1.2:
+  1231→            signal_type = "LONG"
+  1232→            confidence = min(0.7, 0.3 + (coi_pcr - 1.2) * 0.5 + self.rng() * 0.1)
+  1233→        elif coi_pcr < 0.6:
+  1234→            signal_type = "SHORT"
+  1235→            confidence = min(0.95, 0.5 + (0.6 - coi_pcr) * 0.3 + self.rng() * 0.1)
+  1236→        elif coi_pcr < 0.8:
+  1237→            signal_type = "SHORT"
+  1238→            confidence = min(0.7, 0.3 + (0.8 - coi_pcr) * 0.5 + self.rng() * 0.1)
+  1239→
+  1240→        # Update gate condition tracking
+  1241→        if signal_type in ("LONG", "SHORT"):
+  1242→            current_gate = self.gate_condition_active.get(underlying)
+  1243→            if not current_gate or current_gate.get("type") != signal_type:
+  1244→                self.gate_condition_active[underlying] = {
+  1245→                    "type": signal_type,
+  1246→                    "since": int(time.time() * 1000),
+  1247→                }
+  1248→        else:
+  1249→            self.gate_condition_active[underlying] = None
+  1250→
+  1251→        point = {
+  1252→            "timestamp": int(time.time() * 1000),
+  1253→            "coi_pcr": coi_pcr,
+  1254→            "spot": spot,
+  1255→            "ce_coi_sum": matrix["ce_coi_sum"],
+  1256→            "pe_coi_sum": matrix["pe_coi_sum"],
+  1257→            "state": matrix["state"],
+  1258→            "signal_type": signal_type,
+  1259→            "confidence": round3(confidence),
+  1260→        }
+  1261→
+  1262→        if underlying not in self.coi_pcr_history:
+  1263→            self.coi_pcr_history[underlying] = []
+  1264→        self.coi_pcr_history[underlying].append(point)
+  1265→
+  1266→        # Keep max 300 points
+  1267→        if len(self.coi_pcr_history[underlying]) > 300:
+  1268→            self.coi_pcr_history[underlying].pop(0)
+  1269→
+  1270→        self.last_signal_type[underlying] = signal_type
+  1271→
+  1272→    # ================================================================
+  1273→    # Volume Proxy — Live Update
+  1274→    # ================================================================
+  1275→
+  1276→    def _update_volume_proxy(self, underlying: str):
+  1277→        """Update volume proxy with current data point.
+  1278→
+  1279→        Classifies volume as NORMAL/ELEVATED/HIGH/EXTREME.
+  1280→        Creates trap clusters when volume_percent >= 3.0.
+  1281→        """
+  1282→        config = UNDERLYING_CONFIG.get(underlying)
+  1283→        if not config:
+  1284→            return
+  1285→
+  1286→        spot = self.get_spot_price(underlying)
+  1287→        step = config["strike_step"]
+  1288→        atm = round(spot / step) * step
+  1289→
+  1290→        # Simulate volume_percent
+  1291→        volume_percent = 0.5 + self.rng() * 3
+  1292→        # 5% chance of spike
+  1293→        if self.rng() < 0.05:
+  1294→            volume_percent = 5 + self.rng() * 3
+  1295→
+  1296→        if volume_percent >= 5:
+  1297→            classification = "EXTREME"
+  1298→        elif volume_percent >= 3:
+  1299→            classification = "HIGH"
+  1300→        elif volume_percent >= 1.5:
+  1301→            classification = "ELEVATED"
+  1302→        else:
+  1303→            classification = "NORMAL"
+  1304→
+  1305→        point = {
+  1306→            "timestamp": int(time.time() * 1000),
+  1307→            "volume_percent": round2(volume_percent),
+  1308→            "classification": classification,
+  1309→            "spot": round2(spot),
+  1310→        }
+  1311→
+  1312→        if underlying not in self.volume_proxy_history:
+  1313→            self.volume_proxy_history[underlying] = []
+  1314→        self.volume_proxy_history[underlying].append(point)
+  1315→
+  1316→        # Keep max 300 points
+  1317→        if len(self.volume_proxy_history[underlying]) > 300:
+  1318→            self.volume_proxy_history[underlying].pop(0)
+  1319→
+  1320→        # Check for trap clusters when volume is HIGH or EXTREME
+  1321→        if volume_percent >= 3.0:
+  1322→            last_signal = self.last_signal_type.get(underlying, "NEUTRAL")
+  1323→            if last_signal == "LONG":
+  1324→                direction = "BEARISH_TRAP"
+  1325→            elif last_signal == "SHORT":
+  1326→                direction = "BULLISH_TRAP"
+  1327→            else:
+  1328→                direction = "BULLISH_TRAP" if self.rng() > 0.5 else "BEARISH_TRAP"
+  1329→
+  1330→            pain_index = (
+  1331→                atm + int(self.rng() * 4) * step
+  1332→                if direction == "BULLISH_TRAP"
+  1333→                else atm - int(self.rng() * 4) * step
+  1334→            )
+  1335→
+  1336→            now_ms = int(time.time() * 1000)
+  1337→            cluster = {
+  1338→                "id": f"trap_{underlying}_{now_ms}",
+  1339→                "price_high": atm + step,
+  1340→                "price_low": atm - step,
+  1341→                "timestamp_start": now_ms,
+  1342→                "volume_trapped": int(volume_percent * 100_000),
+  1343→                "direction": direction,
+  1344→                "pain_index": pain_index,
+  1345→                "active": True,
+  1346→                "triggered": False,
+  1347→            }
+  1348→
+  1349→            if underlying not in self.trap_clusters_data:
+  1350→                self.trap_clusters_data[underlying] = []
+  1351→            self.trap_clusters_data[underlying].append(cluster)
+  1352→
+  1353→            # Mark older clusters as triggered/inactive (> 10 minutes)
+  1354→            clusters = self.trap_clusters_data[underlying]
+  1355→            for c in clusters[:-1]:
+  1356→                if now_ms - c["timestamp_start"] > 600_000:
+  1357→                    c["active"] = False
+  1358→                    c["triggered"] = True
+  1359→
+  1360→            # Keep max 50 clusters
+  1361→            if len(clusters) > 50:
+  1362→                clusters.pop(0)
+  1363→
+  1364→    # ================================================================
+  1365→    # Public API — 7-Strike History
+  1366→    # ================================================================
+  1367→
+  1368→    def get_7strike_history(self, underlying: str, expiry: str) -> Dict[str, Any]:
+  1369→        """Get 7-Strike history with COI PCR series, volume proxy, trap clusters.
+  1370→
+  1371→        Generates a fresh data point before returning.
+  1372→        """
+  1373→        # Generate fresh current data point
+  1374→        self._update_coi_pcr_history(underlying)
+  1375→        self._update_volume_proxy(underlying)
+  1376→
+  1377→        # Filter active trap clusters
+  1378→        active_traps = [
+  1379→            c for c in self.trap_clusters_data.get(underlying, []) if c.get("active", False)
+  1380→        ]
+  1381→
+  1382→        return {
+  1383→            "underlying": underlying,
+  1384→            "expiry": expiry,
+  1385→            "coi_pcr_series": self.coi_pcr_history.get(underlying, []),
+  1386→            "volume_proxy_series": self.volume_proxy_history.get(underlying, []),
+  1387→            "trap_clusters": active_traps,
+  1388→            "signals": self.signal_history.get(underlying, []),
+  1389→            "trade_suggestions": self.trade_suggestions.get(underlying, []),
+  1390→        }
+  1391→
+  1392→    # ================================================================
+  1393→    # Public API — 7-Strike Trade Suggestions
+  1394→    # ================================================================
+  1395→
+  1396→    def get_7strike_trade_suggestions(self, underlying: str, expiry: str) -> List[Dict]:
+  1397→        """Generate trade suggestions based on current signals.
+  1398→
+  1399→        Rate-limited to 1 per minute per signal type to prevent spam.
+  1400→        Keeps max 50 suggestions.
+  1401→        """
+  1402→        signals = self.get_7strike_signals(underlying, expiry)
+  1403→        current_signal = signals.get("current_signal")
+  1404→
+  1405→        existing = self.trade_suggestions.get(underlying, [])
+  1406→
+  1407→        if not current_signal or current_signal["confidence"] <= 0.6:
+  1408→            return existing
+  1409→
+  1410→        config = UNDERLYING_CONFIG.get(underlying)
+  1411→        if not config:
+  1412→            return existing
+  1413→
+  1414→        lot_size = 15 if underlying == "BANKNIFTY" else 25
+  1415→        step = config["strike_step"]
+  1416→        spot = self.get_spot_price(underlying)
+  1417→        atm = round(spot / step) * step
+  1418→
+  1419→        # Determine expiry for BS pricing
+  1420→        if expiry:
+  1421→            T = self._time_to_expiry(expiry)
+  1422→        else:
+  1423→            thurs = next_thursdays(1)
+  1424→            T = self._time_to_expiry(format_expiry_date(thurs[0]))
+  1425→
+  1426→        iv = config["volatility"]
+  1427→
+  1428→        # Rate-limit: don't generate duplicate suggestions within 1 minute
+  1429→        now_ms = int(time.time() * 1000)
+  1430→        last_suggestion = existing[-1] if existing else None
+  1431→        if (
+  1432→            last_suggestion
+  1433→            and last_suggestion["signal_type"] == current_signal["signal_type"]
+  1434→            and now_ms - last_suggestion["timestamp"] < 60_000
+  1435→        ):
+  1436→            return existing
+  1437→
+  1438→        signal_type = current_signal["signal_type"]
+  1439→        confidence = current_signal["confidence"]
+  1440→
+  1441→        # Option buying: SL below entry, target above entry
+  1442→        sl_pct = 0.30 if confidence > 0.8 else 0.40
+  1443→        target_pct = 1.50 if confidence > 0.8 else 1.00
+  1444→
+  1445→        if signal_type == "LONG":
+  1446→            greeks = self._bs_price(spot, atm, T, iv, "CE")
+  1447→            entry_price = round2(greeks["price"])
+  1448→            stop_loss = max(0.05, round2(entry_price * (1 - sl_pct)))
+  1449→            target = round2(entry_price * (1 + target_pct))
+  1450→            option_suggestion = f"BUY {underlying} {atm} CE (Lot: {lot_size}, Premium: ₹{entry_price})"
+  1451→        else:
+  1452→            greeks = self._bs_price(spot, atm, T, iv, "PE")
+  1453→            entry_price = round2(greeks["price"])
+  1454→            stop_loss = max(0.05, round2(entry_price * (1 - sl_pct)))
+  1455→            target = round2(entry_price * (1 + target_pct))
+  1456→            option_suggestion = f"BUY {underlying} {atm} PE (Lot: {lot_size}, Premium: ₹{entry_price})"
+  1457→
+  1458→        risk = entry_price - stop_loss
+  1459→        reward = target - entry_price
+  1460→        rr_ratio = f"{reward / risk:.1f}" if risk > 0 else "0.0"
+  1461→
+  1462→        suggestion = {
+  1463→            "id": f"trade_{underlying}_{now_ms}",
+  1464→            "signal_type": signal_type,
+  1465→            "entry_price": entry_price,
+  1466→            "stop_loss": stop_loss,
+  1467→            "target": target,
+  1468→            "risk_reward": f"1:{rr_ratio}",
+  1469→            "confidence": round3(confidence),
+  1470→            "reason": current_signal["reason"],
+  1471→            "timestamp": now_ms,
+  1472→            "spot_price": round2(spot),
+  1473→            "coi_pcr": current_signal["coi_pcr"],
+  1474→            "status": "ACTIVE",
+  1475→            "option_suggestion": option_suggestion,
+  1476→            "exit_reason": None,
+  1477→        }
+  1478→
+  1479→        if underlying not in self.trade_suggestions:
+  1480→            self.trade_suggestions[underlying] = []
+  1481→        self.trade_suggestions[underlying].append(suggestion)
+  1482→
+  1483→        # Keep max 50 suggestions
+  1484→        if len(self.trade_suggestions[underlying]) > 50:
+  1485→            self.trade_suggestions[underlying].pop(0)
+  1486→
+  1487→        return self.trade_suggestions[underlying]
+  1488→
+  1489→    # ================================================================
+  1490→    # Public API — Replay Sessions
+  1491→    # ================================================================
+  1492→
+  1493→    def get_replay_sessions(self) -> List[Dict[str, Any]]:
+  1494→        """Get available replay sessions."""
+  1495→        now_ms = int(time.time() * 1000)
+  1496→        return [
+  1497→            {
+  1498→                "session_id": "demo-session-1",
+  1499→                "underlying": "NIFTY",
+  1500→                "start_time": datetime.fromtimestamp((now_ms - 3600000) / 1000).isoformat(),
+  1501→                "end_time": datetime.fromtimestamp(now_ms / 1000).isoformat(),
+  1502→                "candle_count": 60,
+  1503→            },
+  1504→            {
+  1505→                "session_id": "demo-session-2",
+  1506→                "underlying": "BANKNIFTY",
+  1507→                "start_time": datetime.fromtimestamp((now_ms - 7200000) / 1000).isoformat(),
+  1508→                "end_time": datetime.fromtimestamp((now_ms - 3600000) / 1000).isoformat(),
+  1509→                "candle_count": 120,
+  1510→            },
+  1511→        ]
+  1512→
+  1513→    def start_replay(self, session_id: str) -> Dict[str, Any]:
+  1514→        """Start a replay session."""
+  1515→        return {
+  1516→            "session_id": session_id,
+  1517→            "status": "started",
+  1518→            "message": f"Replay session {session_id} started. Data will be emitted via WebSocket.",
+  1519→        }
+  1520→
+  1521→    # ================================================================
+  1522→    # Periodic Update — Called by MarketEngine
+  1523→    # ================================================================
+  1524→
+  1525→    def update(self):
+  1526→        """Update all simulated data. Called periodically by MarketEngine.
+  1527→
+  1528→        Advances spot prices, updates OI, and generates new tick data.
+  1529→        """
+  1530→        for symbol in UNDERLYING_CONFIG:
+  1531→            self._generate_tick(symbol)
+  1532→
+  1533→            # Update PCR history
+  1534→            history = self.pcr_history.get(symbol, [])
+  1535→            if history:
+  1536→                spot = self.spot_prices[symbol]
+  1537→                last_pcr = self.last_pcr.get(symbol, 1.0)
+  1538→                last_pcr += (self.rng() - 0.5) * 0.05
+  1539→                last_pcr = max(0.3, min(2.5, last_pcr))
+  1540→                change_pcr = (self.rng() - 0.5) * 0.1
+  1541→
+  1542→                history.append({
+  1543→                    "timestamp": int(time.time() * 1000),
+  1544→                    "spot": round2(spot),
+  1545→                    "pcr": round3(last_pcr),
+  1546→                    "change_pcr": round3(change_pcr),
+  1547→                })
+  1548→
+  1549→                # Keep max 300 points
+  1550→                if len(history) > 300:
+  1551→                    history.pop(0)
+  1552→
+  1553→                self.pcr_history[symbol] = history
+  1554→                self.last_pcr[symbol] = last_pcr
+  1555→

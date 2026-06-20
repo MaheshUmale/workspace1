@@ -1,0 +1,789 @@
+     1→// ============================================================
+     2→// Unified Data Provider — LIVE Upstox data only.
+     3→// NO SIMULATION. NO MOCK DATA. NO FALLBACK.
+     4→// If Upstox is not connected, returns empty/default data.
+     5→// ============================================================
+     6→
+     7→import { UpstoxClient } from '@/lib/upstox-client';
+     8→import type {
+     9→  CandleData,
+    10→  OptionChainRow,
+    11→  MiniOptionChainRow,
+    12→  MiniOptionEntry,
+    13→  Instrument,
+    14→  ExpiryInfo,
+    15→  OIDatum,
+    16→  PCRPoint,
+    17→  SevenStrikeMatrix,
+    18→  SevenStrikeSignals,
+    19→  SevenStrikeHistory,
+    20→  TradeSuggestion,
+    21→} from '@/lib/market-simulator';
+    22→
+    23→// ============ Data Mode ============
+    24→
+    25→export type DataMode = 'live' | 'offline';
+    26→
+    27→export interface DataProviderHealth {
+    28→  status: string;
+    29→  mode: DataMode;
+    30→  connected: boolean;
+    31→  upstox_configured: boolean;
+    32→  masked_token: string;
+    33→  uptime: number;
+    34→  symbols: string[];
+    35→  tick_count: number;
+    36→  timestamp: number;
+    37→}
+    38→
+    39→// ============ Instrument Key Helpers ============
+    40→
+    41→function mapUnderlyingToUpstox(underlying: string): string {
+    42→  const mapping: Record<string, string> = {
+    43→    NIFTY: 'NSE_INDEX|Nifty 50',
+    44→    BANKNIFTY: 'NSE_INDEX|Nifty Bank',
+    45→  };
+    46→  return mapping[underlying] || underlying;
+    47→}
+    48→
+    49→function mapTimeframeToUpstox(tf: string): string {
+    50→  const mapping: Record<string, string> = {
+    51→    '1m': '1minute',
+    52→    '3m': '3minute',
+    53→    '5m': '5minute',
+    54→    '15m': '15minute',
+    55→    '1h': '1hour',
+    56→    '1d': '1day',
+    57→  };
+    58→  return mapping[tf] || '1minute';
+    59→}
+    60→
+    61→// ============ Upstox to Internal Format Transformers ============
+    62→
+    63→interface UpstoxOptionEntry {
+    64→  strike_price: number;
+    65→  expiry: string;
+    66→  pcr?: number;
+    67→  underlying_key?: string;
+    68→  underlying_spot_price?: number;
+    69→  option_type?: 'CE' | 'PE';
+    70→  instrument_key?: string;
+    71→  last_price?: number;
+    72→  volume?: number;
+    73→  open_interest?: number;
+    74→  change_in_open_interest?: number;
+    75→  bid_price?: number;
+    76→  ask_price?: number;
+    77→  greeks?: {
+    78→    delta: number;
+    79→    gamma: number;
+    80→    theta: number;
+    81→    vega: number;
+    82→    iv: number;
+    83→  };
+    84→  call_options?: {
+    85→    instrument_key: string;
+    86→    market_data: {
+    87→      ltp: number;
+    88→      volume: number;
+    89→      oi: number;
+    90→      change_in_oi: number;
+    91→      close_price: number;
+    92→      bid_price: number;
+    93→      ask_price: number;
+    94→      [key: string]: unknown;
+    95→    };
+    96→    option_greeks?: {
+    97→      delta: number;
+    98→      gamma: number;
+    99→      theta: number;
+   100→      vega: number;
+   101→      iv: number;
+   102→      [key: string]: unknown;
+   103→    };
+   104→    [key: string]: unknown;
+   105→  };
+   106→  put_options?: {
+   107→    instrument_key: string;
+   108→    market_data: {
+   109→      ltp: number;
+   110→      volume: number;
+   111→      oi: number;
+   112→      change_in_oi: number;
+   113→      close_price: number;
+   114→      bid_price: number;
+   115→      ask_price: number;
+   116→      [key: string]: unknown;
+   117→    };
+   118→    option_greeks?: {
+   119→      delta: number;
+   120→      gamma: number;
+   121→      theta: number;
+   122→      vega: number;
+   123→      iv: number;
+   124→      [key: string]: unknown;
+   125→    };
+   126→    [key: string]: unknown;
+   127→  };
+   128→}
+   129→
+   130→function transformUpstoxOptionChain(
+   131→  upstoxData: UpstoxOptionEntry[],
+   132→  underlying: string,
+   133→  expiry: string
+   134→): {
+   135→  underlying: string;
+   136→  expiry: string;
+   137→  spot_price: number;
+   138→  atm_strike: number;
+   139→  strike_step: number;
+   140→  chain: OptionChainRow[];
+   141→} {
+   142→  const step = underlying === 'BANKNIFTY' ? 100 : 50;
+   143→  let spotPrice = 0;
+   144→  const chain: OptionChainRow[] = [];
+   145→
+   146→  for (const entry of upstoxData) {
+   147→    const strike = entry.strike_price;
+   148→    if (spotPrice === 0 && entry.underlying_spot_price) {
+   149→      spotPrice = entry.underlying_spot_price;
+   150→    }
+   151→    const callMd = entry.call_options?.market_data;
+   152→    const callGreeks = entry.call_options?.option_greeks;
+   153→    const putMd = entry.put_options?.market_data;
+   154→    const putGreeks = entry.put_options?.option_greeks;
+   155→
+   156→    chain.push({
+   157→      strike,
+   158→      ce: callMd ? {
+   159→        instrument_key: entry.call_options?.instrument_key || '',
+   160→        ltp: callMd.ltp || 0,
+   161→        oi: callMd.oi || 0,
+   162→        change_oi: callMd.change_in_oi || 0,
+   163→        volume: callMd.volume || 0,
+   164→        iv: callGreeks?.iv || 0,
+   165→        delta: callGreeks?.delta || 0,
+   166→        gamma: callGreeks?.gamma || 0,
+   167→        theta: callGreeks?.theta || 0,
+   168→        vega: callGreeks?.vega || 0,
+   169→        bid_price: callMd.bid_price || 0,
+   170→        ask_price: callMd.ask_price || 0,
+   171→      } : {
+   172→        instrument_key: '',
+   173→        ltp: 0, oi: 0, change_oi: 0, volume: 0,
+   174→        iv: 0, delta: 0, gamma: 0, theta: 0, vega: 0,
+   175→        bid_price: 0, ask_price: 0,
+   176→      },
+   177→      pe: putMd ? {
+   178→        instrument_key: entry.put_options?.instrument_key || '',
+   179→        ltp: putMd.ltp || 0,
+   180→        oi: putMd.oi || 0,
+   181→        change_oi: putMd.change_in_oi || 0,
+   182→        volume: putMd.volume || 0,
+   183→        iv: putGreeks?.iv || 0,
+   184→        delta: putGreeks?.delta || 0,
+   185→        gamma: putGreeks?.gamma || 0,
+   186→        theta: putGreeks?.theta || 0,
+   187→        vega: putGreeks?.vega || 0,
+   188→        bid_price: putMd.bid_price || 0,
+   189→        ask_price: putMd.ask_price || 0,
+   190→      } : {
+   191→        instrument_key: '',
+   192→        ltp: 0, oi: 0, change_oi: 0, volume: 0,
+   193→        iv: 0, delta: 0, gamma: 0, theta: 0, vega: 0,
+   194→        bid_price: 0, ask_price: 0,
+   195→      },
+   196→    });
+   197→  }
+   198→
+   199→  const atm = spotPrice > 0 ? Math.round(spotPrice / step) * step : (chain.length > 0 ? chain[Math.floor(chain.length / 2)].strike : 0);
+   200→
+   201→  return { underlying, expiry, spot_price: spotPrice, atm_strike: atm, strike_step: step, chain };
+   202→}
+   203→
+   204→function transformUpstoxMiniOptionChain(
+   205→  upstoxData: UpstoxOptionEntry[],
+   206→  underlying: string,
+   207→  expiry: string
+   208→): {
+   209→  underlying: string;
+   210→  expiry: string;
+   211→  spot_price: number;
+   212→  atm_strike: number;
+   213→  strike_step: number;
+   214→  chain: MiniOptionChainRow[];
+   215→} {
+   216→  const full = transformUpstoxOptionChain(upstoxData, underlying, expiry);
+   217→  return {
+   218→    ...full,
+   219→    chain: full.chain.map((row) => ({
+   220→      strike: row.strike,
+   221→      ce: {
+   222→        instrument_key: row.ce.instrument_key,
+   223→        ltp: row.ce.ltp,
+   224→        oi: row.ce.oi,
+   225→        change_oi: row.ce.change_oi,
+   226→        volume: row.ce.volume,
+   227→        iv: row.ce.iv,
+   228→        delta: row.ce.delta,
+   229→        bid_price: row.ce.bid_price,
+   230→        ask_price: row.ce.ask_price,
+   231→      } as MiniOptionEntry,
+   232→      pe: {
+   233→        instrument_key: row.pe.instrument_key,
+   234→        ltp: row.pe.ltp,
+   235→        oi: row.pe.oi,
+   236→        change_oi: row.pe.change_oi,
+   237→        volume: row.pe.volume,
+   238→        iv: row.pe.iv,
+   239→        delta: row.pe.delta,
+   240→        bid_price: row.pe.bid_price,
+   241→        ask_price: row.pe.ask_price,
+   242→      } as MiniOptionEntry,
+   243→    })),
+   244→  };
+   245→}
+   246→
+   247→// ============ Empty Data Helpers ============
+   248→
+   249→function emptyOptionChain(underlying: string, expiry: string) {
+   250→  return {
+   251→    underlying,
+   252→    expiry,
+   253→    spot_price: 0,
+   254→    atm_strike: 0,
+   255→    strike_step: underlying === 'BANKNIFTY' ? 100 : 50,
+   256→    chain: [] as OptionChainRow[],
+   257→  };
+   258→}
+   259→
+   260→function emptyMiniOptionChain(underlying: string, expiry: string) {
+   261→  return {
+   262→    ...emptyOptionChain(underlying, expiry),
+   263→    chain: [] as MiniOptionChainRow[],
+   264→  };
+   265→}
+   266→
+   267→function emptyOIData(underlying: string, expiry: string) {
+   268→  return { underlying, expiry, spot_price: 0, data: [] as OIDatum[] };
+   269→}
+   270→
+   271→function emptyPCR(underlying: string, expiry: string) {
+   272→  return { underlying, expiry, data: [] as PCRPoint[], current_pcr: 1, current_change_pcr: 0 };
+   273→}
+   274→
+   275→// ============ Data Provider Class ============
+   276→
+   277→class DataProvider {
+   278→  private upstoxClient: UpstoxClient | null = null;
+   279→  private isLive = false;
+   280→  private start_time = Date.now();
+   281→  private tick_count = 0;
+   282→  // Bug 6: Startup data cache — pre-loaded 5-day 1m candles for each underlying
+   283→  private startupCandlesCache: Map<string, CandleData[]> = new Map();
+   284→  private startupLoadDone = false;
+   285→
+   286→  private validationPromise: Promise<void> | null = null;
+   287→
+   288→  constructor() {
+   289→    const envToken = process.env.UPSTOX_ACCESS_TOKEN;
+   290→    const envApiKey = process.env.UPSTOX_API_KEY;
+   291→
+   292→    if (envToken) {
+   293→      console.log('[DataProvider] Found UPSTOX_ACCESS_TOKEN env var, auto-configuring...');
+   294→      this.upstoxClient = new UpstoxClient(envToken, envApiKey);
+   295→      // Store the promise so other methods can await it
+   296→      this.validationPromise = this.validateAndSetLive();
+   297→    }
+   298→  }
+   299→
+   300→  // Wait for token validation to complete before processing requests
+   301→  private async ensureValidated(): Promise<void> {
+   302→    if (this.validationPromise) {
+   303→      await this.validationPromise;
+   304→    }
+   305→  }
+   306→
+   307→  private async validateAndSetLive(): Promise<void> {
+   308→    if (!this.upstoxClient) return;
+   309→    try {
+   310→      const result = await this.upstoxClient.validateToken();
+   311→      if (result.valid) {
+   312→        this.isLive = true;
+   313→        console.log('[DataProvider] Upstox connected. Mode: LIVE — Real data only');
+   314→        // Don't preload at startup - let data load lazily on demand
+   315→        // This prevents memory issues from loading all candle data at once
+   316→      } else {
+   317→        this.isLive = false;
+   318→        console.warn('[DataProvider] Upstox token invalid:', result.error);
+   319→      }
+   320→    } catch (err) {
+   321→      this.isLive = false;
+   322→      console.error('[DataProvider] Upstox validation failed:', err);
+   323→    }
+   324→  }
+   325→
+   326→  // ============ Bug 6: Pre-load 5 days of 1m candles at startup ============
+   327→
+   328→  private async preloadStartupData(): Promise<void> {
+   329→    if (this.startupLoadDone || !this.upstoxClient) return;
+   330→    this.startupLoadDone = true;
+   331→
+   332→    console.log('[DataProvider] Pre-loading 5 days of 1m candle data...');
+   333→
+   334→    // Load sequentially to avoid overloading
+   335→    for (const underlying of ['NIFTY', 'BANKNIFTY']) {
+   336→      try {
+   337→        const upstoxKey = mapUnderlyingToUpstox(underlying);
+   338→        const result = await this.upstoxClient.getCandles(upstoxKey, '1minute');
+   339→
+   340→        if (result.success && result.data && result.data.length > 0) {
+   341→          const candles: CandleData[] = result.data.map((c) => {
+   342→            const time = typeof c.timestamp === 'string'
+   343→              ? Math.floor(new Date(c.timestamp).getTime() / 1000)
+   344→              : Math.floor(Number(c.timestamp) / 1000);
+   345→            return { time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume };
+   346→          }).sort((a, b) => a.time - b.time);
+   347→
+   348→          // Sanitize
+   349→          const clean = candles.filter(c =>
+   350→            c.close >= c.low && c.close <= c.high &&
+   351→            c.open >= c.low && c.open <= c.high &&
+   352→            c.high >= c.low && c.time > 0
+   353→          );
+   354→
+   355→          // Only keep last 500 candles to save memory
+   356→          const trimmed = clean.slice(-500);
+   357→          this.startupCandlesCache.set(underlying, trimmed);
+   358→          console.log(`[DataProvider] Pre-loaded ${trimmed.length} 1m candles for ${underlying}`);
+   359→        }
+   360→      } catch (err) {
+   361→        console.warn(`[DataProvider] Failed to pre-load candles for ${underlying}:`, err);
+   362→      }
+   363→    }
+   364→  }
+   365→
+   366→  // ============ Configuration ============
+   367→
+   368→  async configureUpstox(accessToken: string, apiKey?: string): Promise<boolean> {
+   369→    const client = new UpstoxClient(accessToken, apiKey);
+   370→    try {
+   371→      const result = await client.validateToken();
+   372→      if (result.valid) {
+   373→        this.upstoxClient = client;
+   374→        this.isLive = true;
+   375→        // Clear startup cache so it reloads with new token
+   376→        this.startupCandlesCache.clear();
+   377→        this.startupLoadDone = false;
+   378→        // Clear the validation promise since we already validated
+   379→        this.validationPromise = Promise.resolve();
+   380→        console.log('[DataProvider] Upstox connected. Mode: LIVE');
+   381→        // Bug 6: Pre-load startup data with new token
+   382→        this.preloadStartupData();
+   383→        return true;
+   384→      } else {
+   385→        console.warn('[DataProvider] Upstox token validation failed:', result.error);
+   386→        return false;
+   387→      }
+   388→    } catch (err) {
+   389→      console.error('[DataProvider] Upstox configuration failed:', err);
+   390→      return false;
+   391→    }
+   392→  }
+   393→
+   394→  disconnectUpstox(): void {
+   395→    this.upstoxClient = null;
+   396→    this.isLive = false;
+   397→    this.startupCandlesCache.clear();
+   398→    this.startupLoadDone = false;
+   399→    this.validationPromise = null;
+   400→    console.log('[DataProvider] Upstox disconnected. Mode: OFFLINE');
+   401→  }
+   402→
+   403→  isLiveData(): boolean {
+   404→    return this.isLive && this.upstoxClient !== null;
+   405→  }
+   406→
+   407→  getMode(): DataMode {
+   408→    return this.isLive ? 'live' : 'offline';
+   409→  }
+   410→
+   411→  getUpstoxClient(): UpstoxClient | null {
+   412→    return this.upstoxClient;
+   413→  }
+   414→
+   415→  // ============ Data Methods — NO SIMULATION FALLBACK ============
+   416→
+   417→  async getCandles(instrumentKey: string, timeframe: string): Promise<CandleData[]> {
+   418→    await this.ensureValidated();
+   419→    if (!this.isLive || !this.upstoxClient) {
+   420→      return []; // No simulation — return empty
+   421→    }
+   422→
+   423→    try {
+   424→      let upstoxKey = instrumentKey;
+   425→      if (instrumentKey === 'NIFTY') {
+   426→        upstoxKey = mapUnderlyingToUpstox('NIFTY');
+   427→      } else if (instrumentKey === 'BANKNIFTY') {
+   428→        upstoxKey = mapUnderlyingToUpstox('BANKNIFTY');
+   429→      }
+   430→
+   431→      // Bug 6: For index underlyings with 1m timeframe, check startup cache first
+   432→      const isIndex = instrumentKey === 'NIFTY' || instrumentKey === 'BANKNIFTY';
+   433→      if (isIndex && timeframe === '1m') {
+   434→        const cached = this.startupCandlesCache.get(instrumentKey);
+   435→        if (cached && cached.length > 0) {
+   436→          // Return cached startup data, but also try to refresh in background
+   437→          this.refreshStartupData(instrumentKey, upstoxKey);
+   438→          this.tick_count++;
+   439→          return [...cached];
+   440→        }
+   441→      }
+   442→
+   443→      const result = await this.upstoxClient.getCandles(upstoxKey, mapTimeframeToUpstox(timeframe));
+   444→
+   445→      if (result.success && result.data && result.data.length > 0) {
+   446→        const rawCandles: CandleData[] = result.data.map((c) => {
+   447→          const time = typeof c.timestamp === 'string'
+   448→            ? Math.floor(new Date(c.timestamp).getTime() / 1000)
+   449→            : Math.floor(Number(c.timestamp) / 1000);
+   450→          return { time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume };
+   451→        }).sort((a, b) => a.time - b.time);
+   452→        // Sanitize: filter out corrupted candles
+   453→        const candles = rawCandles.filter(c =>
+   454→          c.close >= c.low && c.close <= c.high &&
+   455→          c.open >= c.low && c.open <= c.high &&
+   456→          c.high >= c.low && c.time > 0
+   457→        );
+   458→
+   459→        // Bug 6: Cache 1m candles for index underlyings
+   460→        if (isIndex && timeframe === '1m' && candles.length > 0) {
+   461→          this.startupCandlesCache.set(instrumentKey, candles);
+   462→        }
+   463→
+   464→        this.tick_count++;
+   465→        return candles;
+   466→      }
+   467→
+   468→      // Fallback: Try 1m candles if higher timeframe returns empty
+   469→      if (timeframe !== '1m') {
+   470→        console.log(`[DataProvider] No data for ${timeframe}, falling back to 1m candles for ${upstoxKey}`);
+   471→        const fallbackResult = await this.upstoxClient.getCandles(upstoxKey, '1minute');
+   472→        if (fallbackResult.success && fallbackResult.data && fallbackResult.data.length > 0) {
+   473→          const rawCandles: CandleData[] = fallbackResult.data.map((c) => {
+   474→            const time = typeof c.timestamp === 'string'
+   475→              ? Math.floor(new Date(c.timestamp).getTime() / 1000)
+   476→              : Math.floor(Number(c.timestamp) / 1000);
+   477→            return { time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume };
+   478→          }).sort((a, b) => a.time - b.time);
+   479→          const candles = rawCandles.filter(c =>
+   480→            c.close >= c.low && c.close <= c.high &&
+   481→            c.open >= c.low && c.open <= c.high &&
+   482→            c.high >= c.low && c.time > 0
+   483→          );
+   484→          this.tick_count++;
+   485→          return candles;
+   486→        }
+   487→      }
+   488→
+   489→      // Bug 6: Last resort - use startup cache for any timeframe
+   490→      if (isIndex) {
+   491→        const cached = this.startupCandlesCache.get(instrumentKey);
+   492→        if (cached && cached.length > 0) {
+   493→          console.log(`[DataProvider] Using startup cache for ${instrumentKey}`);
+   494→          return [...cached];
+   495→        }
+   496→      }
+   497→
+   498→      return []; // No simulation fallback
+   499→    } catch (err) {
+   500→      console.warn('[DataProvider] Upstox getCandles failed:', err);
+   501→      // Bug 6: Try startup cache on error
+   502→      const isIndex = instrumentKey === 'NIFTY' || instrumentKey === 'BANKNIFTY';
+   503→      if (isIndex) {
+   504→        const cached = this.startupCandlesCache.get(instrumentKey);
+   505→        if (cached && cached.length > 0) {
+   506→          return [...cached];
+   507→        }
+   508→      }
+   509→      return [];
+   510→    }
+   511→  }
+   512→
+   513→  // Background refresh of startup data (non-blocking)
+   514→  private refreshStartupData(instrumentKey: string, upstoxKey: string): void {
+   515→    if (!this.upstoxClient) return;
+   516→    // Fire and forget — don't await
+   517→    this.upstoxClient.getCandles(upstoxKey, '1minute').then(result => {
+   518→      if (result.success && result.data && result.data.length > 0) {
+   519→        const candles: CandleData[] = result.data.map((c) => {
+   520→          const time = typeof c.timestamp === 'string'
+   521→            ? Math.floor(new Date(c.timestamp).getTime() / 1000)
+   522→            : Math.floor(Number(c.timestamp) / 1000);
+   523→          return { time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume };
+   524→        }).sort((a, b) => a.time - b.time)
+   525→          .filter(c =>
+   526→            c.close >= c.low && c.close <= c.high &&
+   527→            c.open >= c.low && c.open <= c.high &&
+   528→            c.high >= c.low && c.time > 0
+   529→          );
+   530→        this.startupCandlesCache.set(instrumentKey, candles);
+   531→      }
+   532→    }).catch(() => {
+   533→      // Silently ignore background refresh errors
+   534→    });
+   535→  }
+   536→
+   537→  async getOptionChain(underlying: string, expiry: string): Promise<{
+   538→    underlying: string;
+   539→    expiry: string;
+   540→    spot_price: number;
+   541→    atm_strike: number;
+   542→    strike_step: number;
+   543→    chain: OptionChainRow[];
+   544→  }> {
+   545→    await this.ensureValidated();
+   546→    if (!this.isLive || !this.upstoxClient) {
+   547→      return emptyOptionChain(underlying, expiry);
+   548→    }
+   549→
+   550→    try {
+   551→      const result = await this.upstoxClient.getOptionChain(underlying, expiry);
+   552→      if (result.success && result.data && result.data.length > 0) {
+   553→        const transformed = transformUpstoxOptionChain(result.data, underlying, expiry);
+   554→        if (result.spot_price && result.spot_price > 0) {
+   555→          transformed.spot_price = result.spot_price;
+   556→          const step = underlying === 'BANKNIFTY' ? 100 : 50;
+   557→          transformed.atm_strike = Math.round(result.spot_price / step) * step;
+   558→        }
+   559→        return transformed;
+   560→      }
+   561→      return emptyOptionChain(underlying, expiry);
+   562→    } catch (err) {
+   563→      console.warn('[DataProvider] Upstox getOptionChain failed:', err);
+   564→      return emptyOptionChain(underlying, expiry);
+   565→    }
+   566→  }
+   567→
+   568→  async getMiniOptionChain(underlying: string, expiry: string): Promise<{
+   569→    underlying: string;
+   570→    expiry: string;
+   571→    spot_price: number;
+   572→    atm_strike: number;
+   573→    strike_step: number;
+   574→    chain: MiniOptionChainRow[];
+   575→  }> {
+   576→    await this.ensureValidated();
+   577→    if (!this.isLive || !this.upstoxClient) {
+   578→      return emptyMiniOptionChain(underlying, expiry);
+   579→    }
+   580→
+   581→    try {
+   582→      const result = await this.upstoxClient.getOptionChain(underlying, expiry);
+   583→      if (result.success && result.data && result.data.length > 0) {
+   584→        const transformed = transformUpstoxMiniOptionChain(result.data, underlying, expiry);
+   585→        // Filter to ATM ±10 strikes
+   586→        const atm = transformed.atm_strike;
+   587→        const step = transformed.strike_step;
+   588→        const filtered = transformed.chain.filter(
+   589→          (row) => row.strike >= atm - 10 * step && row.strike <= atm + 10 * step
+   590→        );
+   591→        transformed.chain = filtered;
+   592→        return transformed;
+   593→      }
+   594→      return emptyMiniOptionChain(underlying, expiry);
+   595→    } catch (err) {
+   596→      console.warn('[DataProvider] Upstox getMiniOptionChain failed:', err);
+   597→      return emptyMiniOptionChain(underlying, expiry);
+   598→    }
+   599→  }
+   600→
+   601→  async getOIData(underlying: string, expiry: string): Promise<{
+   602→    underlying: string;
+   603→    expiry: string;
+   604→    spot_price: number;
+   605→    data: OIDatum[];
+   606→  }> {
+   607→    await this.ensureValidated();
+   608→    if (!this.isLive || !this.upstoxClient) {
+   609→      return emptyOIData(underlying, expiry);
+   610→    }
+   611→
+   612→    try {
+   613→      const result = await this.upstoxClient.getOptionChain(underlying, expiry);
+   614→      if (result.success && result.data && result.data.length > 0) {
+   615→        const oiData: OIDatum[] = [];
+   616→        for (const entry of result.data) {
+   617→          const strike = entry.strike_price;
+   618→          const callMd = entry.call_options?.market_data;
+   619→          const putMd = entry.put_options?.market_data;
+   620→          oiData.push({
+   621→            timestamp: Date.now(),
+   622→            strike,
+   623→            ce_oi: callMd?.oi ?? 0,
+   624→            ce_change_oi: callMd?.change_in_oi ?? 0,
+   625→            pe_oi: putMd?.oi ?? 0,
+   626→            pe_change_oi: putMd?.change_in_oi ?? 0,
+   627→          });
+   628→        }
+   629→        const spot = result.data[0]?.underlying_spot_price || 0;
+   630→        return { underlying, expiry, spot_price: spot, data: oiData };
+   631→      }
+   632→      return emptyOIData(underlying, expiry);
+   633→    } catch (err) {
+   634→      console.warn('[DataProvider] Upstox getOIData failed:', err);
+   635→      return emptyOIData(underlying, expiry);
+   636→    }
+   637→  }
+   638→
+   639→  async getPCR(underlying: string, expiry: string): Promise<{
+   640→    underlying: string;
+   641→    expiry: string;
+   642→    data: PCRPoint[];
+   643→    current_pcr: number;
+   644→    current_change_pcr: number;
+   645→  }> {
+   646→    await this.ensureValidated();
+   647→    if (!this.isLive || !this.upstoxClient) {
+   648→      return emptyPCR(underlying, expiry);
+   649→    }
+   650→
+   651→    try {
+   652→      const result = await this.upstoxClient.getOptionChain(underlying, expiry);
+   653→      if (result.success && result.data && result.data.length > 0) {
+   654→        // Calculate PCR from live OI data
+   655→        let totalCEOI = 0;
+   656→        let totalPEOI = 0;
+   657→        for (const entry of result.data) {
+   658→          const callMd = entry.call_options?.market_data;
+   659→          const putMd = entry.put_options?.market_data;
+   660→          totalCEOI += callMd?.oi ?? 0;
+   661→          totalPEOI += putMd?.oi ?? 0;
+   662→        }
+   663→        const currentPCR = totalCEOI > 0 ? totalPEOI / totalCEOI : 1;
+   664→        return {
+   665→          underlying,
+   666→          expiry,
+   667→          data: [{
+   668→            timestamp: Date.now(),
+   669→            spot: result.data[0]?.underlying_spot_price || 0,
+   670→            pcr: Math.round(currentPCR * 1000) / 1000,
+   671→            change_pcr: 0,
+   672→          }],
+   673→          current_pcr: Math.round(currentPCR * 1000) / 1000,
+   674→          current_change_pcr: 0,
+   675→        };
+   676→      }
+   677→      return emptyPCR(underlying, expiry);
+   678→    } catch (err) {
+   679→      console.warn('[DataProvider] Upstox getPCR failed:', err);
+   680→      return emptyPCR(underlying, expiry);
+   681→    }
+   682→  }
+   683→
+   684→  async searchInstruments(query: string): Promise<Instrument[]> {
+   685→    // For search, return empty — no simulation
+   686→    return [];
+   687→  }
+   688→
+   689→  async getExpiries(underlying: string): Promise<ExpiryInfo[]> {
+   690→    await this.ensureValidated();
+   691→    if (!this.isLive || !this.upstoxClient) {
+   692→      return [];
+   693→    }
+   694→
+   695→    try {
+   696→      const result = await this.upstoxClient.getExpiries(underlying);
+   697→      if (result.success && result.data && result.data.length > 0) {
+   698→        const now = new Date();
+   699→        return result.data.map((expiryStr: string) => {
+   700→          const expiryDate = new Date(expiryStr);
+   701→          const diffDays = Math.ceil((expiryDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+   702→          const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+   703→          return {
+   704→            expiry_date: expiryStr,
+   705→            expiry_label: `${expiryDate.getDate()} ${months[expiryDate.getMonth()]} ${expiryDate.getFullYear()}`,
+   706→            is_weekly: true,
+   707→            days_to_expiry: diffDays,
+   708→          };
+   709→        });
+   710→      }
+   711→      return [];
+   712→    } catch (err) {
+   713→      console.warn('[DataProvider] Upstox getExpiries failed:', err);
+   714→      return [];
+   715→    }
+   716→  }
+   717→
+   718→  get7StrikeMatrix(_underlying: string, _expiry: string): SevenStrikeMatrix {
+   719→    // 7-Strike matrix requires live OI data — return empty if not live
+   720→    return {} as SevenStrikeMatrix;
+   721→  }
+   722→
+   723→  get7StrikeSignals(_underlying: string, _expiry: string): SevenStrikeSignals {
+   724→    return {} as SevenStrikeSignals;
+   725→  }
+   726→
+   727→  get7StrikeHistory(_underlying: string, _expiry: string): SevenStrikeHistory {
+   728→    return {} as SevenStrikeHistory;
+   729→  }
+   730→
+   731→  get7StrikeTradeSuggestions(_underlying: string, _expiry: string): TradeSuggestion[] {
+   732→    return [];
+   733→  }
+   734→
+   735→  getReplaySessions(): Array<{
+   736→    session_id: string;
+   737→    underlying: string;
+   738→    start_time: string;
+   739→    end_time: string;
+   740→    candle_count: number;
+   741→  }> {
+   742→    return [];
+   743→  }
+   744→
+   745→  startReplay(_sessionId: string): {
+   746→    session_id: string;
+   747→    status: string;
+   748→    message: string;
+   749→  } {
+   750→    return { session_id: '', status: 'error', message: 'No replay data available' };
+   751→  }
+   752→
+   753→  // ============ Health Check ============
+   754→
+   755→  getHealth(): DataProviderHealth {
+   756→    return {
+   757→      status: 'ok',
+   758→      mode: this.getMode(),
+   759→      connected: this.isLive,
+   760→      upstox_configured: this.upstoxClient !== null,
+   761→      masked_token: this.upstoxClient?.getMaskedToken() || '',
+   762→      uptime: (Date.now() - this.start_time) / 1000,
+   763→      symbols: ['NIFTY', 'BANKNIFTY'],
+   764→      tick_count: this.tick_count,
+   765→      timestamp: Date.now(),
+   766→    };
+   767→  }
+   768→}
+   769→
+   770→// ============ Singleton Export ============
+   771→
+   772→const GLOBAL_KEY = '__tradingDataProvider__' as const;
+   773→
+   774→declare global {
+   775→  // eslint-disable-next-line no-var
+   776→  var __tradingDataProvider__: DataProvider | undefined;
+   777→}
+   778→
+   779→export function getDataProvider(): DataProvider {
+   780→  if (!globalThis[GLOBAL_KEY]) {
+   781→    globalThis[GLOBAL_KEY] = new DataProvider();
+   782→  }
+   783→  return globalThis[GLOBAL_KEY];
+   784→}
+   785→
+   786→export function resetDataProvider(): void {
+   787→  globalThis[GLOBAL_KEY] = undefined;
+   788→}
+   789→

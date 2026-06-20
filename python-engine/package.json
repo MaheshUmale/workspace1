@@ -1,0 +1,10 @@
+{
+  "name": "python-engine",
+  "version": "1.0.0",
+  "description": "Python FastAPI Trading Engine for 7Strike Terminal - Standalone Backend",
+  "scripts": {
+    "dev": "cd /home/z/my-project/python-engine && python -m uvicorn main:app --host 0.0.0.0 --port 3035 --reload",
+    "start": "cd /home/z/my-project/python-engine && python -m uvicorn main:app --host 0.0.0.0 --port 3035",
+    "install-deps": "pip install --break-system-packages -r /home/z/my-project/python-engine/requirements.txt"
+  }
+}

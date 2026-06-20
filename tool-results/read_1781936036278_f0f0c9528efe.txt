@@ -1,0 +1,758 @@
+     1→"""
+     2→Market Engine — Core orchestration layer for the 7Strike Trading Terminal
+     3→=========================================================================
+     4→
+     5→In LIVE mode: Fetches REAL data from Upstox API, transforms to internal format,
+     6→              computes 7-Strike signals from live OI data, stores to DuckDB.
+     7→In SIMULATION mode: Uses DataSimulator for all data.
+     8→
+     9→The engine provides a UNIFIED interface regardless of mode — the caller
+    10→never needs to know whether data came from Upstox or the simulator.
+    11→"""
+    12→
+    13→import time
+    14→import asyncio
+    15→import json
+    16→from typing import Optional, Dict, Any, List
+    17→from datetime import datetime
+    18→
+    19→from data_simulator import DataSimulator
+    20→from upstox_client import UpstoxClient
+    21→from db import get_db
+    22→from config import UPSTOX_ACCESS_TOKEN, UNDERLYING_CONFIG, RISK_FREE_RATE
+    23→
+    24→
+    25→def _norm(v, default=0):
+    26→    """Normalize a value that might be None or NaN."""
+    27→    if v is None:
+    28→        return default
+    29→    try:
+    30→        if v != v:  # NaN check
+    31→            return default
+    32→    except TypeError:
+    33→        return default
+    34→    return v
+    35→
+    36→
+    37→class MarketEngine:
+    38→    """Core market engine that orchestrates simulator and live data, pushes events."""
+    39→
+    40→    def __init__(self):
+    41→        self.simulator = DataSimulator()
+    42→        self.upstox: Optional[UpstoxClient] = None
+    43→        self.mode = "simulation"
+    44→        self.is_connected = False
+    45→        self.tick_count = 0
+    46→        self.start_time = time.time()
+    47→        self._db = get_db()
+    48→        self._update_task: Optional[asyncio.Task] = None
+    49→        # Cache live option chain data per symbol for 7-strike calculations
+    50→        self._live_chain_cache: Dict[str, dict] = {}
+    51→
+    52→    # ================================================================
+    53→    # Initialization & Shutdown
+    54→    # ================================================================
+    55→
+    56→    async def initialize(self):
+    57→        """Initialize engine — validate Upstox token if available."""
+    58→        if UPSTOX_ACCESS_TOKEN:
+    59→            self.upstox = UpstoxClient(UPSTOX_ACCESS_TOKEN)
+    60→            result = await self.upstox.validate_token()
+    61→            if result.get("valid"):
+    62→                self.mode = "live"
+    63→                self.is_connected = True
+    64→                print(f"[MarketEngine] Upstox connected. Mode: LIVE — Real data only")
+    65→            else:
+    66→                print(f"[MarketEngine] Upstox token invalid: {result.get('error')}. Mode: SIMULATION")
+    67→        else:
+    68→            print("[MarketEngine] No Upstox token. Mode: SIMULATION")
+    69→
+    70→        # Pre-populate database with simulator history (provides baseline data)
+    71→        self._store_simulator_history()
+    72→
+    73→        # Start periodic update task
+    74→        self._update_task = asyncio.create_task(self._periodic_update())
+    75→
+    76→    def shutdown(self):
+    77→        """Gracefully shut down the engine and all resources."""
+    78→        if self._update_task:
+    79→            self._update_task.cancel()
+    80→        if self.upstox:
+    81→            asyncio.create_task(self.upstox.close())
+    82→        self._db.close()
+    83→        print("[MarketEngine] Shutdown complete.")
+    84→
+    85→    # ================================================================
+    86→    # Database Pre-population
+    87→    # ================================================================
+    88→
+    89→    def _store_simulator_history(self):
+    90→        """Store simulator's pre-generated historical data into DuckDB."""
+    91→        for symbol in ["NIFTY", "BANKNIFTY"]:
+    92→            history = self.simulator.get_7strike_history(symbol, "")
+    93→            for point in history.get("coi_pcr_series", []):
+    94→                self._db.store_coi_pcr_point(symbol, point)
+    95→            for point in history.get("volume_proxy_series", []):
+    96→                self._db.store_volume_proxy(symbol, point)
+    97→            for trade in history.get("trade_suggestions", []):
+    98→                trade_with_symbol = {**trade, "symbol": symbol}
+    99→                self._db.store_trade_suggestion(trade_with_symbol)
+   100→            for cluster in history.get("trap_clusters", []):
+   101→                cluster_with_symbol = {**cluster, "symbol": symbol}
+   102→                self._db.store_trap_cluster(cluster_with_symbol)
+   103→            for signal in history.get("signals", []):
+   104→                self._db.store_signal(symbol, signal)
+   105→            pcr_data = self.simulator.get_pcr(symbol, "")
+   106→            for point in pcr_data.get("data", []):
+   107→                self._db.store_pcr_point(symbol, point)
+   108→            from config import TIMEFRAME_MAP
+   109→            for tf in TIMEFRAME_MAP:
+   110→                candles = self.simulator.get_candles(symbol, tf)
+   111→                if candles:
+   112→                    self._db.store_candles(symbol, tf, candles)
+   113→
+   114→        print(f"[MarketEngine] Pre-populated DB with simulator history")
+   115→
+   116→    # ================================================================
+   117→    # Periodic Update Loop
+   118→    # ================================================================
+   119→
+   120→    async def _periodic_update(self):
+   121→        """Periodic update loop — fetches live data or advances simulator."""
+   122→        while True:
+   123→            try:
+   124→                await asyncio.sleep(3)
+   125→                self.tick_count += 1
+   126→
+   127→                if self.mode == "live" and self.upstox:
+   128→                    await self._update_live_data()
+   129→                else:
+   130→                    self.simulator.update()
+   131→                    for symbol in ["NIFTY", "BANKNIFTY"]:
+   132→                        self._update_symbol_to_db_from_sim(symbol)
+   133→
+   134→            except asyncio.CancelledError:
+   135→                break
+   136→            except Exception as e:
+   137→                print(f"[MarketEngine] Update error: {e}")
+   138→                await asyncio.sleep(5)
+   139→
+   140→    async def _update_live_data(self):
+   141→        """Fetch live data from Upstox and process it."""
+   142→        for symbol in ["NIFTY", "BANKNIFTY"]:
+   143→            try:
+   144→                # Get the latest expiry for this symbol
+   145→                config = UNDERLYING_CONFIG.get(symbol, {})
+   146→                step = config.get("strike_step", 50)
+   147→
+   148→                # Fetch live option chain
+   149→                result = await self.upstox.get_option_chain(symbol, "")
+   150→                if not result.get("success") or not result.get("data"):
+   151→                    continue
+   152→
+   153→                upstox_data = result["data"]
+   154→                spot_price = result.get("spot_price", 0)
+   155→                if not spot_price and upstox_data:
+   156→                    spot_price = _norm(upstox_data[0].get("underlying_spot_price"), 0)
+   157→                if not spot_price:
+   158→                    continue
+   159→
+   160→                atm = round(spot_price / step) * step
+   161→
+   162→                # Transform to our internal format and cache
+   163→                chain = self._transform_upstox_chain(upstox_data, symbol, step)
+   164→                self._live_chain_cache[symbol] = {
+   165→                    "spot_price": spot_price,
+   166→                    "atm_strike": atm,
+   167→                    "strike_step": step,
+   168→                    "chain": chain,
+   169→                    "timestamp": int(time.time() * 1000),
+   170→                }
+   171→
+   172→                # Compute 7-strike matrix from live data
+   173→                matrix = self._compute_7strike_matrix_live(symbol, "", spot_price, atm, step, chain)
+   174→                if matrix:
+   175→                    self._db.store_coi_pcr_point(symbol, {
+   176→                        "timestamp": int(time.time() * 1000),
+   177→                        "coi_pcr": matrix["coi_pcr"],
+   178→                        "spot": matrix["spot_price"],
+   179→                        "ce_coi_sum": matrix["ce_coi_sum"],
+   180→                        "pe_coi_sum": matrix["pe_coi_sum"],
+   181→                        "state": matrix["state"],
+   182→                        "signal_type": "NEUTRAL",
+   183→                        "confidence": 0,
+   184→                    })
+   185→
+   186→                    # Compute signals
+   187→                    signals = self._compute_signals_live(symbol, "", matrix)
+   188→                    if signals and signals.get("current_signal"):
+   189→                        cs = signals["current_signal"]
+   190→                        self._db.store_signal(symbol, cs)
+   191→
+   192→                        # Update the last COI PCR point with signal info
+   193→                        self._db.store_coi_pcr_point(symbol, {
+   194→                            "timestamp": int(time.time() * 1000),
+   195→                            "coi_pcr": matrix["coi_pcr"],
+   196→                            "spot": matrix["spot_price"],
+   197→                            "ce_coi_sum": matrix["ce_coi_sum"],
+   198→                            "pe_coi_sum": matrix["pe_coi_sum"],
+   199→                            "state": matrix["state"],
+   200→                            "signal_type": cs["signal_type"],
+   201→                            "confidence": cs["confidence"],
+   202→                        })
+   203→
+   204→                # Store option chain snapshot for replay
+   205→                self._db.store_option_chain_snapshot(
+   206→                    symbol, "", spot_price, atm,
+   207→                    json.dumps([{
+   208→                        "strike": r["strike"],
+   209→                        "ce_oi": r["ce"]["oi"], "ce_change_oi": r["ce"]["change_oi"],
+   210→                        "pe_oi": r["pe"]["oi"], "pe_change_oi": r["pe"]["change_oi"],
+   211→                        "ce_ltp": r["ce"]["ltp"], "pe_ltp": r["pe"]["ltp"],
+   212→                    } for r in chain])
+   213→                )
+   214→
+   215→                # Compute and store PCR
+   216→                total_ce_oi = sum(r["ce"]["oi"] for r in chain)
+   217→                total_pe_oi = sum(r["pe"]["oi"] for r in chain)
+   218→                pcr_val = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 1.0
+   219→                self._db.store_pcr_point(symbol, {
+   220→                    "timestamp": int(time.time() * 1000),
+   221→                    "spot": spot_price,
+   222→                    "pcr": round(pcr_val, 4),
+   223→                    "change_pcr": 0,
+   224→                })
+   225→
+   226→            except Exception as e:
+   227→                print(f"[MarketEngine] Live update error for {symbol}: {e}")
+   228→
+   229→    def _update_symbol_to_db_from_sim(self, symbol: str):
+   230→        """Update DB with simulator data for a single symbol."""
+   231→        now_ms = int(time.time() * 1000)
+   232→        matrix = self.simulator.get_7strike_matrix(symbol, "")
+   233→        if matrix:
+   234→            point = {
+   235→                "timestamp": now_ms,
+   236→                "coi_pcr": matrix["coi_pcr"],
+   237→                "spot": matrix["spot_price"],
+   238→                "ce_coi_sum": matrix["ce_coi_sum"],
+   239→                "pe_coi_sum": matrix["pe_coi_sum"],
+   240→                "state": matrix["state"],
+   241→                "signal_type": "NEUTRAL",
+   242→                "confidence": 0,
+   243→            }
+   244→            signals = self.simulator.get_7strike_signals(symbol, "")
+   245→            if signals and signals.get("current_signal"):
+   246→                cs = signals["current_signal"]
+   247→                point["signal_type"] = cs["signal_type"]
+   248→                point["confidence"] = cs["confidence"]
+   249→                self._db.store_signal(symbol, cs)
+   250→            self._db.store_coi_pcr_point(symbol, point)
+   251→
+   252→        pcr = self.simulator.get_pcr(symbol, "")
+   253→        if pcr and pcr.get("data"):
+   254→            last = pcr["data"][-1]
+   255→            self._db.store_pcr_point(symbol, last)
+   256→
+   257→    # ================================================================
+   258→    # Upstox Data Transformers (Live Mode)
+   259→    # ================================================================
+   260→
+   261→    def _transform_upstox_chain(self, upstox_data: list, symbol: str, step: int) -> list:
+   262→        """Transform Upstox option chain format to our internal OptionChainRow format.
+   263→
+   264→        Upstox returns: [{ strike_price, call_options: { market_data: {ltp, oi, change_in_oi, ...}, option_greeks: {...} },
+   265→                          put_options: { market_data: {...}, option_greeks: {...} } }]
+   266→        """
+   267→        chain = []
+   268→        for entry in upstox_data:
+   269→            strike = _norm(entry.get("strike_price"), 0)
+   270→            if not strike:
+   271→                continue
+   272→
+   273→            call_md = (entry.get("call_options") or {}).get("market_data", {})
+   274→            call_gk = (entry.get("call_options") or {}).get("option_greeks", {})
+   275→            put_md = (entry.get("put_options") or {}).get("market_data", {})
+   276→            put_gk = (entry.get("put_options") or {}).get("option_greeks", {})
+   277→
+   278→            chain.append({
+   279→                "strike": strike,
+   280→                "ce": {
+   281→                    "instrument_key": (entry.get("call_options") or {}).get("instrument_key", ""),
+   282→                    "ltp": _norm(call_md.get("ltp"), 0),
+   283→                    "oi": _norm(call_md.get("oi"), 0),
+   284→                    "change_oi": _norm(call_md.get("change_in_oi"), 0),
+   285→                    "volume": _norm(call_md.get("volume"), 0),
+   286→                    "iv": _norm(call_gk.get("iv"), 0),
+   287→                    "delta": _norm(call_gk.get("delta"), 0),
+   288→                    "gamma": _norm(call_gk.get("gamma"), 0),
+   289→                    "theta": _norm(call_gk.get("theta"), 0),
+   290→                    "vega": _norm(call_gk.get("vega"), 0),
+   291→                    "bid_price": _norm(call_md.get("bid_price"), 0),
+   292→                    "ask_price": _norm(call_md.get("ask_price"), 0),
+   293→                },
+   294→                "pe": {
+   295→                    "instrument_key": (entry.get("put_options") or {}).get("instrument_key", ""),
+   296→                    "ltp": _norm(put_md.get("ltp"), 0),
+   297→                    "oi": _norm(put_md.get("oi"), 0),
+   298→                    "change_oi": _norm(put_md.get("change_in_oi"), 0),
+   299→                    "volume": _norm(put_md.get("volume"), 0),
+   300→                    "iv": _norm(put_gk.get("iv"), 0),
+   301→                    "delta": _norm(put_gk.get("delta"), 0),
+   302→                    "gamma": _norm(put_gk.get("gamma"), 0),
+   303→                    "theta": _norm(put_gk.get("theta"), 0),
+   304→                    "vega": _norm(put_gk.get("vega"), 0),
+   305→                    "bid_price": _norm(put_md.get("bid_price"), 0),
+   306→                    "ask_price": _norm(put_md.get("ask_price"), 0),
+   307→                },
+   308→            })
+   309→        return chain
+   310→
+   311→    def _compute_7strike_matrix_live(self, symbol: str, expiry: str, spot: float, atm: int, step: int, chain: list) -> Optional[dict]:
+   312→        """Compute 7-Strike COI PCR Matrix from live option chain data."""
+   313→        # Build 7-strike window: ATM ±3
+   314→        window_strikes = [atm + i * step for i in range(-3, 4)]
+   315→
+   316→        # Map chain by strike for quick lookup
+   317→        chain_by_strike = {r["strike"]: r for r in chain}
+   318→
+   319→        rows = []
+   320→        for s in window_strikes:
+   321→            r = chain_by_strike.get(s)
+   322→            if r:
+   323→                rows.append({
+   324→                    "strike": s,
+   325→                    "ce_coi": r["ce"]["change_oi"],
+   326→                    "pe_coi": r["pe"]["change_oi"],
+   327→                    "ce_oi": r["ce"]["oi"],
+   328→                    "pe_oi": r["pe"]["oi"],
+   329→                })
+   330→            else:
+   331→                rows.append({"strike": s, "ce_coi": 0, "pe_coi": 0, "ce_oi": 0, "pe_oi": 0})
+   332→
+   333→        ce_coi_sum = sum(r["ce_coi"] for r in rows)
+   334→        pe_coi_sum = sum(r["pe_coi"] for r in rows)
+   335→        coi_pcr = round(pe_coi_sum / ce_coi_sum, 3) if ce_coi_sum != 0 else 1.0
+   336→
+   337→        # State determination
+   338→        if coi_pcr > 1.5 or coi_pcr < 0.6:
+   339→            state = "ACTIVE"
+   340→        elif coi_pcr > 1.2 or coi_pcr < 0.8:
+   341→            state = "ZONE_WATCH"
+   342→        else:
+   343→            state = "IDLE"
+   344→
+   345→        return {
+   346→            "underlying": symbol,
+   347→            "expiry": expiry,
+   348→            "spot_price": round(spot, 2),
+   349→            "atm_strike": atm,
+   350→            "strike_step": step,
+   351→            "window_strikes": window_strikes,
+   352→            "rows": rows,
+   353→            "ce_coi_sum": ce_coi_sum,
+   354→            "pe_coi_sum": pe_coi_sum,
+   355→            "coi_pcr": coi_pcr,
+   356→            "state": state,
+   357→        }
+   358→
+   359→    def _compute_signals_live(self, symbol: str, expiry: str, matrix: dict) -> Optional[dict]:
+   360→        """Compute 7-Strike signals from live matrix data."""
+   361→        import random
+   362→        coi_pcr = matrix["coi_pcr"]
+   363→
+   364→        signal_type = "NEUTRAL"
+   365→        confidence = 0
+   366→        reason = "No significant COI PCR divergence"
+   367→        gate_condition = None
+   368→        volume_percent = None
+   369→        pain_index = None
+   370→
+   371→        if coi_pcr > 1.5:
+   372→            signal_type = "LONG"
+   373→            confidence = min(0.95, 0.5 + (coi_pcr - 1.5) * 0.3)
+   374→            reason = f"Strong PE COI buildup (PCR: {coi_pcr:.3f}) suggests bearish resistance, bullish signal"
+   375→            gate_condition = "LONG"
+   376→            volume_percent = 75 + random.random() * 20
+   377→        elif coi_pcr > 1.2:
+   378→            signal_type = "LONG"
+   379→            confidence = min(0.7, 0.3 + (coi_pcr - 1.2) * 0.5)
+   380→            reason = f"Moderate PE COI dominance (PCR: {coi_pcr:.3f}), watch for confirmation"
+   381→            gate_condition = "LONG"
+   382→        elif coi_pcr < 0.6:
+   383→            signal_type = "SHORT"
+   384→            confidence = min(0.95, 0.5 + (0.6 - coi_pcr) * 0.3)
+   385→            reason = f"Strong CE COI buildup (PCR: {coi_pcr:.3f}) suggests bullish resistance, bearish signal"
+   386→            gate_condition = "SHORT"
+   387→            volume_percent = 75 + random.random() * 20
+   388→        elif coi_pcr < 0.8:
+   389→            signal_type = "SHORT"
+   390→            confidence = min(0.7, 0.3 + (0.8 - coi_pcr) * 0.5)
+   391→            reason = f"Moderate CE COI dominance (PCR: {coi_pcr:.3f}), watch for confirmation"
+   392→            gate_condition = "SHORT"
+   393→
+   394→        pain_index = coi_pcr > 1 and matrix["atm_strike"] + (coi_pcr - 1) * 50 or matrix["atm_strike"] - (1 - coi_pcr) * 50
+   395→
+   396→        current_signal = {
+   397→            "signal_type": signal_type,
+   398→            "confidence": round(confidence, 3),
+   399→            "reason": reason,
+   400→            "timestamp": int(time.time() * 1000),
+   401→            "spot_price": matrix["spot_price"],
+   402→            "coi_pcr": coi_pcr,
+   403→            "volume_percent": volume_percent,
+   404→            "gate_condition": gate_condition,
+   405→            "pain_index": round(pain_index, 1),
+   406→        }
+   407→
+   408→        # Get recent signals from DB
+   409→        db_signals = self._db.get_signals(symbol, 20)
+   410→
+   411→        return {
+   412→            "underlying": symbol,
+   413→            "expiry": expiry,
+   414→            "signals": db_signals,
+   415→            "current_signal": current_signal,
+   416→            "gate_condition": gate_condition or "NONE",
+   417→            "state": matrix["state"],
+   418→        }
+   419→
+   420→    # ================================================================
+   421→    # Public Data Access Methods — AUTO SWITCH LIVE/SIM
+   422→    # ================================================================
+   423→
+   424→    async def get_candles_async(self, instrument_key: str, timeframe: str) -> list:
+   425→        """Get candle data. LIVE mode fetches from Upstox, SIM uses simulator."""
+   426→        if self.mode == "live" and self.upstox:
+   427→            result = await self.upstox.get_candles(instrument_key, timeframe)
+   428→            if result.get("success") and result.get("data"):
+   429→                # Transform Upstox candle format
+   430→                candles = []
+   431→                for c in result["data"]:
+   432→                    try:
+   433→                        ts = c[0] if isinstance(c[0], (int, float)) else int(c[0])
+   434→                        # Upstox returns [timestamp, open, high, low, close, volume]
+   435→                        candles.append({
+   436→                            "time": int(ts) if ts > 1e12 else int(ts),
+   437→                            "open": float(c[1]),
+   438→                            "high": float(c[2]),
+   439→                            "low": float(c[3]),
+   440→                            "close": float(c[4]),
+   441→                            "volume": int(c[5]) if len(c) > 5 else 0,
+   442→                        })
+   443→                    except (IndexError, ValueError, TypeError):
+   444→                        continue
+   445→                if candles:
+   446→                    return candles
+   447→        return self.simulator.get_candles(instrument_key, timeframe)
+   448→
+   449→    def get_candles(self, instrument_key: str, timeframe: str) -> list:
+   450→        """Synchronous candle fetch (uses DB cache in live mode)."""
+   451→        # In live mode, check DB first
+   452→        if self.mode == "live":
+   453→            db_candles = self._db.get_candles(instrument_key, timeframe)
+   454→            if db_candles:
+   455→                return db_candles
+   456→        return self.simulator.get_candles(instrument_key, timeframe)
+   457→
+   458→    async def get_option_chain_async(self, underlying: str, expiry: str) -> dict:
+   459→        """Get option chain. LIVE mode fetches from Upstox."""
+   460→        if self.mode == "live" and self.upstox:
+   461→            result = await self.upstox.get_option_chain(underlying, expiry)
+   462→            if result.get("success") and result.get("data"):
+   463→                config = UNDERLYING_CONFIG.get(underlying, {})
+   464→                step = config.get("strike_step", 50)
+   465→                spot = result.get("spot_price", 0)
+   466→                atm = round(spot / step) * step if spot else 0
+   467→                chain = self._transform_upstox_chain(result["data"], underlying, step)
+   468→                return {
+   469→                    "underlying": underlying,
+   470→                    "expiry": expiry,
+   471→                    "spot_price": round(spot, 2),
+   472→                    "atm_strike": atm,
+   473→                    "strike_step": step,
+   474→                    "chain": chain,
+   475→                }
+   476→        return self.simulator.get_option_chain(underlying, expiry)
+   477→
+   478→    def get_option_chain(self, underlying: str, expiry: str) -> dict:
+   479→        """Get option chain (sync — uses cached live data or simulator)."""
+   480→        if self.mode == "live" and underlying in self._live_chain_cache:
+   481→            cached = self._live_chain_cache[underlying]
+   482→            return {
+   483→                "underlying": underlying,
+   484→                "expiry": expiry,
+   485→                "spot_price": cached["spot_price"],
+   486→                "atm_strike": cached["atm_strike"],
+   487→                "strike_step": cached["strike_step"],
+   488→                "chain": cached["chain"],
+   489→            }
+   490→        return self.simulator.get_option_chain(underlying, expiry)
+   491→
+   492→    async def get_mini_option_chain_async(self, underlying: str, expiry: str) -> dict:
+   493→        """Get mini option chain. LIVE mode uses Upstox data."""
+   494→        full = await self.get_option_chain_async(underlying, expiry)
+   495→        atm = full.get("atm_strike", 0)
+   496→        step = full.get("strike_step", 50)
+   497→        # Filter to ATM ±10 strikes
+   498→        filtered = [r for r in full.get("chain", []) if atm - 10 * step <= r["strike"] <= atm + 10 * step]
+   499→        return {
+   500→            "underlying": full["underlying"],
+   501→            "expiry": full["expiry"],
+   502→            "spot_price": full["spot_price"],
+   503→            "atm_strike": atm,
+   504→            "strike_step": step,
+   505→            "chain": [{
+   506→                "strike": r["strike"],
+   507→                "ce": {k: v for k, v in r["ce"].items() if k not in ("gamma", "theta", "vega")},
+   508→                "pe": {k: v for k, v in r["pe"].items() if k not in ("gamma", "theta", "vega")},
+   509→            } for r in filtered],
+   510→        }
+   511→
+   512→    def get_mini_option_chain(self, underlying: str, expiry: str) -> dict:
+   513→        """Synchronous mini option chain."""
+   514→        full = self.get_option_chain(underlying, expiry)
+   515→        atm = full.get("atm_strike", 0)
+   516→        step = full.get("strike_step", 50)
+   517→        filtered = [r for r in full.get("chain", []) if atm - 10 * step <= r["strike"] <= atm + 10 * step]
+   518→        return {
+   519→            "underlying": full["underlying"],
+   520→            "expiry": full["expiry"],
+   521→            "spot_price": full["spot_price"],
+   522→            "atm_strike": atm,
+   523→            "strike_step": step,
+   524→            "chain": [{
+   525→                "strike": r["strike"],
+   526→                "ce": {k: v for k, v in r["ce"].items() if k not in ("gamma", "theta", "vega")},
+   527→                "pe": {k: v for k, v in r["pe"].items() if k not in ("gamma", "theta", "vega")},
+   528→            } for r in filtered],
+   529→        }
+   530→
+   531→    async def get_oi_data_async(self, underlying: str, expiry: str) -> dict:
+   532→        """Get OI data. LIVE mode from Upstox."""
+   533→        if self.mode == "live" and underlying in self._live_chain_cache:
+   534→            cached = self._live_chain_cache[underlying]
+   535→            return {
+   536→                "underlying": underlying,
+   537→                "expiry": expiry,
+   538→                "spot_price": cached["spot_price"],
+   539→                "data": [{
+   540→                    "timestamp": cached["timestamp"],
+   541→                    "strike": r["strike"],
+   542→                    "ce_oi": r["ce"]["oi"],
+   543→                    "ce_change_oi": r["ce"]["change_oi"],
+   544→                    "pe_oi": r["pe"]["oi"],
+   545→                    "pe_change_oi": r["pe"]["change_oi"],
+   546→                } for r in cached["chain"]],
+   547→            }
+   548→        return self.simulator.get_oi_data(underlying, expiry)
+   549→
+   550→    def get_oi_data(self, underlying: str, expiry: str) -> dict:
+   551→        return self.simulator.get_oi_data(underlying, expiry)
+   552→
+   553→    async def get_pcr_async(self, underlying: str, expiry: str) -> dict:
+   554→        """Get PCR history. In LIVE mode, returns DB-stored data."""
+   555→        if self.mode == "live":
+   556→            db_data = self._db.get_pcr_history(underlying, 300)
+   557→            if db_data:
+   558→                current = db_data[-1]
+   559→                return {
+   560→                    "underlying": underlying,
+   561→                    "expiry": expiry,
+   562→                    "data": db_data,
+   563→                    "current_pcr": current.get("pcr", 1.0),
+   564→                    "current_change_pcr": current.get("change_pcr", 0),
+   565→                }
+   566→        return self.simulator.get_pcr(underlying, expiry)
+   567→
+   568→    def get_pcr(self, underlying: str, expiry: str) -> dict:
+   569→        return self.simulator.get_pcr(underlying, expiry)
+   570→
+   571→    async def get_expiries_async(self, underlying: str) -> list:
+   572→        """Get expiries. LIVE mode fetches from Upstox."""
+   573→        if self.mode == "live" and self.upstox:
+   574→            result = await self.upstox.get_expiries(underlying)
+   575→            if result.get("success") and result.get("data"):
+   576→                now = datetime.now()
+   577→                months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+   578→                expiries = []
+   579→                for exp_str in result["data"]:
+   580→                    try:
+   581→                        d = datetime.strptime(exp_str, "%Y-%m-%d")
+   582→                        diff_days = (d - now).days
+   583→                        expiries.append({
+   584→                            "expiry_date": exp_str,
+   585→                            "expiry_label": f"{d.day()} {months[d.month - 1]} {d.year}",
+   586→                            "is_weekly": True,
+   587→                            "days_to_expiry": diff_days,
+   588→                        })
+   589→                    except ValueError:
+   590→                        continue
+   591→                if expiries:
+   592→                    return expiries
+   593→        return self.simulator.get_expiries(underlying)
+   594→
+   595→    def get_expiries(self, underlying: str) -> list:
+   596→        return self.simulator.get_expiries(underlying)
+   597→
+   598→    def search_instruments(self, query: str) -> list:
+   599→        """Search instruments — always uses simulator (deterministic)."""
+   600→        return self.simulator.search_instruments(query)
+   601→
+   602→    async def get_7strike_matrix_async(self, underlying: str, expiry: str) -> dict:
+   603→        """Get 7-Strike matrix. LIVE mode computes from cached live chain."""
+   604→        if self.mode == "live" and underlying in self._live_chain_cache:
+   605→            cached = self._live_chain_cache[underlying]
+   606→            matrix = self._compute_7strike_matrix_live(
+   607→                underlying, expiry,
+   608→                cached["spot_price"], cached["atm_strike"],
+   609→                cached["strike_step"], cached["chain"]
+   610→            )
+   611→            if matrix:
+   612→                return matrix
+   613→        return self.simulator.get_7strike_matrix(underlying, expiry)
+   614→
+   615→    def get_7strike_matrix(self, underlying: str, expiry: str) -> dict:
+   616→        """Synchronous matrix (uses cached live data or simulator)."""
+   617→        if self.mode == "live" and underlying in self._live_chain_cache:
+   618→            cached = self._live_chain_cache[underlying]
+   619→            matrix = self._compute_7strike_matrix_live(
+   620→                underlying, expiry,
+   621→                cached["spot_price"], cached["atm_strike"],
+   622→                cached["strike_step"], cached["chain"]
+   623→            )
+   624→            if matrix:
+   625→                return matrix
+   626→        return self.simulator.get_7strike_matrix(underlying, expiry)
+   627→
+   628→    async def get_7strike_signals_async(self, underlying: str, expiry: str) -> dict:
+   629→        """Get signals. LIVE mode computes from live matrix."""
+   630→        if self.mode == "live":
+   631→            matrix = await self.get_7strike_matrix_async(underlying, expiry)
+   632→            signals = self._compute_signals_live(underlying, expiry, matrix)
+   633→            if signals:
+   634→                return signals
+   635→        return self.simulator.get_7strike_signals(underlying, expiry)
+   636→
+   637→    def get_7strike_signals(self, underlying: str, expiry: str) -> dict:
+   638→        return self.simulator.get_7strike_signals(underlying, expiry)
+   639→
+   640→    async def get_7strike_history_async(self, underlying: str, expiry: str) -> dict:
+   641→        """Get 7-Strike history. LIVE mode returns DB data + current live state."""
+   642→        if self.mode == "live":
+   643→            # Get DB-stored historical data
+   644→            coi_series = self._db.get_coi_pcr_history(underlying, 300)
+   645→            vol_series = self._db.get_volume_proxy(underlying, 300)
+   646→            traps = self._db.get_active_trap_clusters(underlying)
+   647→            trades = self._db.get_trade_suggestions(underlying, 50)
+   648→            signals = self._db.get_signals(underlying, 50)
+   649→
+   650→            # If DB has data, use it; otherwise fall back to simulator
+   651→            if coi_series:
+   652→                return {
+   653→                    "underlying": underlying,
+   654→                    "expiry": expiry,
+   655→                    "coi_pcr_series": coi_series,
+   656→                    "volume_proxy_series": vol_series,
+   657→                    "trap_clusters": traps,
+   658→                    "signals": signals,
+   659→                    "trade_suggestions": trades,
+   660→                }
+   661→        return self.simulator.get_7strike_history(underlying, expiry)
+   662→
+   663→    def get_7strike_history(self, underlying: str, expiry: str) -> dict:
+   664→        return self.simulator.get_7strike_history(underlying, expiry)
+   665→
+   666→    async def get_7strike_trade_suggestions_async(self, underlying: str, expiry: str) -> list:
+   667→        """Get trade suggestions. LIVE mode generates from live signals."""
+   668→        if self.mode == "live":
+   669→            signals_data = await self.get_7strike_signals_async(underlying, expiry)
+   670→            cs = signals_data.get("current_signal")
+   671→            if cs and cs["confidence"] > 0.6 and cs["signal_type"] != "NEUTRAL":
+   672→                config = UNDERLYING_CONFIG.get(underlying, {})
+   673→                step = config.get("strike_step", 50)
+   674→                lot_size = config.get("lot_size", 25)
+   675→
+   676→                cached = self._live_chain_cache.get(underlying, {})
+   677→                spot = cached.get("spot_price", 0)
+   678→                atm = cached.get("atm_strike", 0)
+   679→
+   680→                # Find the ATM option price from live chain
+   681→                chain_by_strike = {r["strike"]: r for r in cached.get("chain", [])}
+   682→                atm_row = chain_by_strike.get(atm, {})
+   683→
+   684→                signal_type = cs["signal_type"]
+   685→                sl_pct = 0.30 if cs["confidence"] > 0.8 else 0.40
+   686→                target_pct = 1.50 if cs["confidence"] > 0.8 else 1.00
+   687→
+   688→                if signal_type == "LONG":
+   689→                    opt = atm_row.get("ce", {})
+   690→                    entry = _norm(opt.get("ltp"), 0)
+   691→                    opt_name = f"BUY {underlying} {atm} CE"
+   692→                else:
+   693→                    opt = atm_row.get("pe", {})
+   694→                    entry = _norm(opt.get("ltp"), 0)
+   695→                    opt_name = f"BUY {underlying} {atm} PE"
+   696→
+   697→                if not entry:
+   698→                    return self._db.get_trade_suggestions(underlying, 10)
+   699→
+   700→                sl = round(entry * (1 - sl_pct), 2)
+   701→                target = round(entry * (1 + target_pct), 2)
+   702→                risk = entry - sl
+   703→                reward = target - entry
+   704→                rr = f"1:{round(reward / risk, 1)}" if risk > 0 else "1:0"
+   705→
+   706→                trade = {
+   707→                    "id": f"trade_{underlying}_{int(time.time() * 1000)}",
+   708→                    "signal_type": signal_type,
+   709→                    "entry_price": entry,
+   710→                    "stop_loss": sl,
+   711→                    "target": target,
+   712→                    "risk_reward": rr,
+   713→                    "confidence": cs["confidence"],
+   714→                    "reason": cs["reason"],
+   715→                    "timestamp": int(time.time() * 1000),
+   716→                    "spot_price": round(spot, 2),
+   717→                    "coi_pcr": cs["coi_pcr"],
+   718→                    "status": "ACTIVE",
+   719→                    "option_suggestion": f"{opt_name} (Lot: {lot_size}, Premium: ₹{entry})",
+   720→                    "exit_reason": None,
+   721→                }
+   722→                self._db.store_trade_suggestion({**trade, "symbol": underlying})
+   723→                return self._db.get_trade_suggestions(underlying, 10)
+   724→
+   725→            # No active signal
+   726→            return self._db.get_trade_suggestions(underlying, 10)
+   727→        return self.simulator.get_7strike_trade_suggestions(underlying, expiry)
+   728→
+   729→    def get_7strike_trade_suggestions(self, underlying: str, expiry: str) -> list:
+   730→        return self.simulator.get_7strike_trade_suggestions(underlying, expiry)
+   731→
+   732→    def get_replay_sessions(self) -> list:
+   733→        return self.simulator.get_replay_sessions()
+   734→
+   735→    def start_replay(self, session_id: str) -> dict:
+   736→        return self.simulator.start_replay(session_id)
+   737→
+   738→    # ================================================================
+   739→    # Health & Status
+   740→    # ================================================================
+   741→
+   742→    def get_health(self) -> Dict[str, Any]:
+   743→        """Get engine health and status information."""
+   744→        masked_token = ""
+   745→        if self.upstox:
+   746→            masked_token = self.upstox.get_masked_token()
+   747→        return {
+   748→            "status": "ok",
+   749→            "mode": self.mode,
+   750→            "connected": self.is_connected,
+   751→            "upstox_configured": bool(UPSTOX_ACCESS_TOKEN),
+   752→            "masked_token": masked_token,
+   753→            "uptime": time.time() - self.start_time,
+   754→            "symbols": ["NIFTY", "BANKNIFTY"],
+   755→            "tick_count": self.tick_count,
+   756→            "timestamp": int(time.time() * 1000),
+   757→        }
+   758→

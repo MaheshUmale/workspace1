@@ -1,0 +1,1606 @@
+     1→     1→// ============================================================
+     2→     2→// Market Data Simulator — Singleton Engine
+     3→     3→// Generates realistic Indian market data in-memory
+     4→     4→// ============================================================
+     5→     5→
+     6→     6→// ============ Seeded PRNG (Mulberry32) ============
+     7→     7→
+     8→     8→function mulberry32(seed: number): () => number {
+     9→     9→  let s = seed | 0;
+    10→    10→  return () => {
+    11→    11→    s = (s + 0x6d2b79f5) | 0;
+    12→    12→    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    13→    13→    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    14→    14→    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    15→    15→  };
+    16→    16→}
+    17→    17→
+    18→    18→// ============ Normal distribution (Box-Muller) ============
+    19→    19→
+    20→    20→function normalRandom(rng: () => number, mean = 0, std = 1): number {
+    21→    21→  const u1 = rng();
+    22→    22→  const u2 = rng();
+    23→    23→  const z = Math.sqrt(-2 * Math.log(u1 || 1e-10)) * Math.cos(2 * Math.PI * u2);
+    24→    24→  return z * std + mean;
+    25→    25→}
+    26→    26→
+    27→    27→// ============ Types ============
+    28→    28→
+    29→    29→export interface CandleData {
+    30→    30→  time: number;
+    31→    31→  open: number;
+    32→    32→  high: number;
+    33→    33→  low: number;
+    34→    34→  close: number;
+    35→    35→  volume: number;
+    36→    36→}
+    37→    37→
+    38→    38→export interface SpotTick {
+    39→    39→  symbol: string;
+    40→    40→  ltp: number;
+    41→    41→  change: number;
+    42→    42→  change_pct: number;
+    43→    43→  open: number;
+    44→    44→  high: number;
+    45→    45→  low: number;
+    46→    46→  close: number;
+    47→    47→  volume: number;
+    48→    48→  timestamp: number;
+    49→    49→}
+    50→    50→
+    51→    51→export interface OptionEntry {
+    52→    52→  instrument_key: string;
+    53→    53→  ltp: number;
+    54→    54→  oi: number;
+    55→    55→  change_oi: number;
+    56→    56→  volume: number;
+    57→    57→  iv: number;
+    58→    58→  delta: number;
+    59→    59→  gamma: number;
+    60→    60→  theta: number;
+    61→    61→  vega: number;
+    62→    62→  bid_price: number;
+    63→    63→  ask_price: number;
+    64→    64→}
+    65→    65→
+    66→    66→export interface OptionChainRow {
+    67→    67→  strike: number;
+    68→    68→  ce: OptionEntry;
+    69→    69→  pe: OptionEntry;
+    70→    70→}
+    71→    71→
+    72→    72→export interface MiniOptionEntry {
+    73→    73→  instrument_key: string;
+    74→    74→  ltp: number;
+    75→    75→  oi: number;
+    76→    76→  change_oi: number;
+    77→    77→  volume: number;
+    78→    78→  iv: number;
+    79→    79→  delta: number;
+    80→    80→  bid_price: number;
+    81→    81→  ask_price: number;
+    82→    82→}
+    83→    83→
+    84→    84→export interface MiniOptionChainRow {
+    85→    85→  strike: number;
+    86→    86→  ce: MiniOptionEntry;
+    87→    87→  pe: MiniOptionEntry;
+    88→    88→}
+    89→    89→
+    90→    90→export interface Instrument {
+    91→    91→  instrument_key: string;
+    92→    92→  name: string;
+    93→    93→  underlying: string;
+    94→    94→  type: 'INDEX' | 'FUT' | 'CE' | 'PE';
+    95→    95→  expiry?: string;
+    96→    96→  strike?: number;
+    97→    97→  display_name?: string;
+    98→    98→}
+    99→    99→
+   100→   100→export interface ExpiryInfo {
+   101→   101→  expiry_date: string;
+   102→   102→  expiry_label: string;
+   103→   103→  is_weekly: boolean;
+   104→   104→  days_to_expiry: number;
+   105→   105→}
+   106→   106→
+   107→   107→export interface OIDatum {
+   108→   108→  timestamp: number;
+   109→   109→  strike: number;
+   110→   110→  ce_oi: number;
+   111→   111→  ce_change_oi: number;
+   112→   112→  pe_oi: number;
+   113→   113→  pe_change_oi: number;
+   114→   114→}
+   115→   115→
+   116→   116→export interface PCRPoint {
+   117→   117→  timestamp: number;
+   118→   118→  spot: number;
+   119→   119→  pcr: number;
+   120→   120→  change_pcr: number;
+   121→   121→}
+   122→   122→
+   123→   123→export interface SevenStrikeRow {
+   124→   124→  strike: number;
+   125→   125→  ce_coi: number;
+   126→   126→  pe_coi: number;
+   127→   127→  ce_oi: number;
+   128→   128→  pe_oi: number;
+   129→   129→}
+   130→   130→
+   131→   131→export interface SevenStrikeMatrix {
+   132→   132→  underlying: string;
+   133→   133→  expiry: string;
+   134→   134→  spot_price: number;
+   135→   135→  atm_strike: number;
+   136→   136→  strike_step: number;
+   137→   137→  window_strikes: number[];
+   138→   138→  rows: SevenStrikeRow[];
+   139→   139→  ce_coi_sum: number;
+   140→   140→  pe_coi_sum: number;
+   141→   141→  coi_pcr: number;
+   142→   142→  state: string;
+   143→   143→}
+   144→   144→
+   145→   145→export interface Signal {
+   146→   146→  signal_type: string;
+   147→   147→  confidence: number;
+   148→   148→  reason: string;
+   149→   149→  timestamp: number;
+   150→   150→  spot_price: number;
+   151→   151→  coi_pcr: number;
+   152→   152→  volume_percent: number | null;
+   153→   153→  gate_condition: string | null;
+   154→   154→  pain_index: number | null;
+   155→   155→}
+   156→   156→
+   157→   157→export interface SevenStrikeSignals {
+   158→   158→  underlying: string;
+   159→   159→  expiry: string;
+   160→   160→  signals: Signal[];
+   161→   161→  current_signal: Signal | null;
+   162→   162→  gate_condition: string;
+   163→   163→  state: string;
+   164→   164→}
+   165→   165→
+   166→   166→export interface COIPCRPoint {
+   167→   167→  timestamp: number;
+   168→   168→  coi_pcr: number;
+   169→   169→  spot: number;
+   170→   170→  ce_coi_sum: number;
+   171→   171→  pe_coi_sum: number;
+   172→   172→  state: string;
+   173→   173→  signal_type: string;
+   174→   174→  confidence: number;
+   175→   175→}
+   176→   176→
+   177→   177→export interface TradeSuggestion {
+   178→   178→  id: string;
+   179→   179→  signal_type: 'LONG' | 'SHORT';
+   180→   180→  entry_price: number;
+   181→   181→  stop_loss: number;
+   182→   182→  target: number;
+   183→   183→  risk_reward: string;
+   184→   184→  confidence: number;
+   185→   185→  reason: string;
+   186→   186→  timestamp: number;
+   187→   187→  spot_price: number;
+   188→   188→  coi_pcr: number;
+   189→   189→  status: 'ACTIVE' | 'HIT_TARGET' | 'HIT_SL' | 'EXPIRED' | 'CANCELLED';
+   190→   190→  option_suggestion: string;
+   191→   191→  exit_reason: string | null;
+   192→   192→}
+   193→   193→
+   194→   194→export interface VolumeProxyPoint {
+   195→   195→  timestamp: number;
+   196→   196→  volume_percent: number;
+   197→   197→  classification: 'NORMAL' | 'ELEVATED' | 'HIGH' | 'EXTREME';
+   198→   198→  spot: number;
+   199→   199→}
+   200→   200→
+   201→   201→export interface TrapCluster {
+   202→   202→  id: string;
+   203→   203→  price_high: number;
+   204→   204→  price_low: number;
+   205→   205→  timestamp_start: number;
+   206→   206→  volume_trapped: number;
+   207→   207→  direction: 'BULLISH_TRAP' | 'BEARISH_TRAP';
+   208→   208→  pain_index: number;
+   209→   209→  active: boolean;
+   210→   210→  triggered: boolean;
+   211→   211→}
+   212→   212→
+   213→   213→export interface SevenStrikeHistory {
+   214→   214→  underlying: string;
+   215→   215→  expiry: string;
+   216→   216→  coi_pcr_series: COIPCRPoint[];
+   217→   217→  volume_proxy_series: VolumeProxyPoint[];
+   218→   218→  trap_clusters: TrapCluster[];
+   219→   219→  signals: Signal[];
+   220→   220→  trade_suggestions: TradeSuggestion[];
+   221→   221→}
+   222→   222→
+   223→   223→// ============ Helper functions ============
+   224→   224→
+   225→   225→function nextThursdays(count: number): Date[] {
+   226→   226→  const now = new Date();
+   227→   227→  const results: Date[] = [];
+   228→   228→  const d = new Date(now);
+   229→   229→  // Find next Thursday (4 = Thursday)
+   230→   230→  while (d.getDay() !== 4) {
+   231→   231→    d.setDate(d.getDate() + 1);
+   232→   232→  }
+   233→   233→  for (let i = 0; i < count; i++) {
+   234→   234→    results.push(new Date(d));
+   235→   235→    d.setDate(d.getDate() + 7);
+   236→   236→  }
+   237→   237→  return results;
+   238→   238→}
+   239→   239→
+   240→   240→function formatDateLabel(d: Date): string {
+   241→   241→  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+   242→   242→  return `${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}`;
+   243→   243→}
+   244→   244→
+   245→   245→function formatExpiryDate(d: Date): string {
+   246→   246→  const y = d.getFullYear();
+   247→   247→  const m = String(d.getMonth() + 1).padStart(2, '0');
+   248→   248→  const day = String(d.getDate()).padStart(2, '0');
+   249→   249→  return `${y}-${m}-${day}`;
+   250→   250→}
+   251→   251→
+   252→   252→function compactExpiry(expiryDate: string): string {
+   253→   253→  // "2026-06-25" -> "260625"
+   254→   254→  return expiryDate.replace(/-/g, '').slice(2);
+   255→   255→}
+   256→   256→
+   257→   257→// Cumulative Normal Distribution (Abramowitz & Stegun approximation)
+   258→   258→function cdf(x: number): number {
+   259→   259→  const a1 = 0.254829592;
+   260→   260→  const a2 = -0.284496736;
+   261→   261→  const a3 = 1.421413741;
+   262→   262→  const a4 = -1.453152027;
+   263→   263→  const a5 = 1.061405429;
+   264→   264→  const p = 0.3275911;
+   265→   265→  const sign = x < 0 ? -1 : 1;
+   266→   266→  x = Math.abs(x) / Math.SQRT2;
+   267→   267→  const t = 1.0 / (1.0 + p * x);
+   268→   268→  const y = 1.0 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+   269→   269→  return 0.5 * (1.0 + sign * y);
+   270→   270→}
+   271→   271→
+   272→   272→// Standard Normal PDF
+   273→   273→function ndist(x: number): number {
+   274→   274→  return Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
+   275→   275→}
+   276→   276→
+   277→   277→// ============ Constants ============
+   278→   278→
+   279→   279→const UNDERLYING_CONFIG: Record<string, {
+   280→   280→  basePrice: number;
+   281→   281→  strikeStep: number;
+   282→   282→  volatility: number;
+   283→   283→  displayName: string;
+   284→   284→}> = {
+   285→   285→  NIFTY: {
+   286→   286→    basePrice: 23500,
+   287→   287→    strikeStep: 50,
+   288→   288→    volatility: 0.13,
+   289→   289→    displayName: 'NIFTY 50',
+   290→   290→  },
+   291→   291→  BANKNIFTY: {
+   292→   292→    basePrice: 51000,
+   293→   293→    strikeStep: 100,
+   294→   294→    volatility: 0.16,
+   295→   295→    displayName: 'BANK NIFTY',
+   296→   296→  },
+   297→   297→};
+   298→   298→
+   299→   299→const TIMEFRAME_SECONDS: Record<string, number> = {
+   300→   300→  '1m': 60,
+   301→   301→  '3m': 180,
+   302→   302→  '5m': 300,
+   303→   303→  '15m': 900,
+   304→   304→  '1h': 3600,
+   305→   305→};
+   306→   306→
+   307→   307→const RISK_FREE_RATE = 0.07;
+   308→   308→
+   309→   309→// ============ Market Simulator Class ============
+   310→   310→
+   311→   311→class MarketSimulator {
+   312→   312→  private rng: () => number;
+   313→   313→  private spotPrices: Record<string, number>;
+   314→   314→  private openPrices: Record<string, number>;
+   315→   315→  private highPrices: Record<string, number>;
+   316→   316→  private lowPrices: Record<string, number>;
+   317→   317→  private prevClosePrices: Record<string, number>;
+   318→   318→  private volumes: Record<string, number>;
+   319→   319→  private candles: Record<string, CandleData[]>;
+   320→   320→  private oiData: Record<string, Record<number, { ce_oi: number; ce_change_oi: number; pe_oi: number; pe_change_oi: number }>>;
+   321→   321→  private pcrHistory: Record<string, PCRPoint[]>;
+   322→   322→  private tickCount: number;
+   323→   323→  private signalHistory: Record<string, Signal[]>;
+   324→   324→  private lastState: Record<string, string>;
+   325→   325→  private lastPcr: Record<string, number>;
+   326→   326→  private coiPcrHistory: Record<string, COIPCRPoint[]> = {};
+   327→   327→  private volumeProxyHistory: Record<string, VolumeProxyPoint[]> = {};
+   328→   328→  private trapClustersData: Record<string, TrapCluster[]> = {};
+   329→   329→  private tradeSuggestions: Record<string, TradeSuggestion[]> = {};
+   330→   330→  private lastATMStrike: Record<string, number> = {};
+   331→   331→  private stabilizationUntil: Record<string, number> = {};
+   332→   332→  private lastSignalType: Record<string, string> = {};
+   333→   333→  private gateConditionActive: Record<string, { type: 'LONG' | 'SHORT'; since: number } | null> = {};
+   334→   334→
+   335→   335→  constructor() {
+   336→   336→    this.rng = mulberry32(42);
+   337→   337→    this.spotPrices = {};
+   338→   338→    this.openPrices = {};
+   339→   339→    this.highPrices = {};
+   340→   340→    this.lowPrices = {};
+   341→   341→    this.prevClosePrices = {};
+   342→   342→    this.volumes = {};
+   343→   343→    this.candles = {};
+   344→   344→    this.oiData = {};
+   345→   345→    this.pcrHistory = {};
+   346→   346→    this.tickCount = 0;
+   347→   347→    this.signalHistory = {};
+   348→   348→    this.lastState = {};
+   349→   349→    this.lastPcr = {};
+   350→   350→
+   351→   351→    // Initialize for each underlying
+   352→   352→    for (const [symbol, config] of Object.entries(UNDERLYING_CONFIG)) {
+   353→   353→      const startPrice = config.basePrice + (this.rng() - 0.5) * config.basePrice * 0.02;
+   354→   354→      this.spotPrices[symbol] = startPrice;
+   355→   355→      this.openPrices[symbol] = startPrice;
+   356→   356→      this.highPrices[symbol] = startPrice * 1.005;
+   357→   357→      this.lowPrices[symbol] = startPrice * 0.995;
+   358→   358→      this.prevClosePrices[symbol] = startPrice * (1 + (this.rng() - 0.5) * 0.01);
+   359→   359→      this.volumes[symbol] = Math.floor(this.rng() * 5_000_000) + 1_000_000;
+   360→   360→      this.candles[symbol] = [];
+   361→   361→      this.oiData[symbol] = {};
+   362→   362→      this.pcrHistory[symbol] = [];
+   363→   363→      this.signalHistory[symbol] = [];
+   364→   364→      this.lastState[symbol] = 'IDLE';
+   365→   365→      this.lastPcr[symbol] = 1.0;
+   366→   366→    }
+   367→   367→
+   368→   368→    // Generate historical candle data for each underlying and timeframe
+   369→   369→    this.generateHistoricalCandles();
+   370→   370→    // Generate initial OI data
+   371→   371→    this.generateInitialOI();
+   372→   372→    // Generate initial PCR history
+   373→   373→    this.generateInitialPCR();
+   374→   374→    // Generate 7-Strike COI PCR history (120 points simulating 2 hours of 1-min data)
+   375→   375→    this.generate7StrikeHistory();
+   376→   376→  }
+   377→   377→
+   378→   378→  // ============ Spot Price Generation ============
+   379→   379→
+   380→   380→  generateTick(symbol: string): SpotTick {
+   381→   381→    const config = UNDERLYING_CONFIG[symbol];
+   382→   382→    if (!config) {
+   383→   383→      throw new Error(`Unknown symbol: ${symbol}`);
+   384→   384→    }
+   385→   385→
+   386→   386→    const prevPrice = this.spotPrices[symbol];
+   387→   387→    // GBM: dS = mu * S * dt + sigma * S * sqrt(dt) * Z
+   388→   388→    const mu = 0.0001; // small drift
+   389→   389→    const dt = 1 / 252 / 375; // ~1 tick in a trading day
+   390→   390→    const sigma = config.volatility;
+   391→   391→    const z = normalRandom(this.rng);
+   392→   392→    const dS = mu * prevPrice * dt + sigma * prevPrice * Math.sqrt(dt) * z;
+   393→   393→    const newPrice = Math.max(prevPrice + dS, prevPrice * 0.95); // prevent going too low
+   394→   394→
+   395→   395→    this.spotPrices[symbol] = newPrice;
+   396→   396→    this.highPrices[symbol] = Math.max(this.highPrices[symbol], newPrice);
+   397→   397→    this.lowPrices[symbol] = Math.min(this.lowPrices[symbol], newPrice);
+   398→   398→    this.volumes[symbol] += Math.floor(this.rng() * 5000) + 100;
+   399→   399→
+   400→   400→    const change = newPrice - this.prevClosePrices[symbol];
+   401→   401→    const changePct = (change / this.prevClosePrices[symbol]) * 100;
+   402→   402→
+   403→   403→    this.tickCount++;
+   404→   404→
+   405→   405→    // Occasionally update OI
+   406→   406→    if (this.tickCount % 5 === 0) {
+   407→   407→      this.updateOI(symbol);
+   408→   408→    }
+   409→   409→
+   410→   410→    return {
+   411→   411→      symbol,
+   412→   412→      ltp: Math.round(newPrice * 100) / 100,
+   413→   413→      change: Math.round(change * 100) / 100,
+   414→   414→      change_pct: Math.round(changePct * 100) / 100,
+   415→   415→      open: Math.round(this.openPrices[symbol] * 100) / 100,
+   416→   416→      high: Math.round(this.highPrices[symbol] * 100) / 100,
+   417→   417→      low: Math.round(this.lowPrices[symbol] * 100) / 100,
+   418→   418→      close: Math.round(newPrice * 100) / 100,
+   419→   419→      volume: this.volumes[symbol],
+   420→   420→      timestamp: Date.now(),
+   421→   421→    };
+   422→   422→  }
+   423→   423→
+   424→   424→  getSpotPrice(symbol: string): number {
+   425→   425→    return this.spotPrices[symbol] ?? UNDERLYING_CONFIG[symbol]?.basePrice ?? 23500;
+   426→   426→  }
+   427→   427→
+   428→   428→  // ============ Historical Candle Generation ============
+   429→   429→
+   430→   430→  private generateHistoricalCandles(): void {
+   431→   431→    const now = Math.floor(Date.now() / 1000);
+   432→   432→
+   433→   433→    for (const symbol of Object.keys(UNDERLYING_CONFIG)) {
+   434→   434→      for (const [tf, tfSeconds] of Object.entries(TIMEFRAME_SECONDS)) {
+   435→   435→        const key = `${symbol}_${tf}`;
+   436→   436→        const candles: CandleData[] = [];
+   437→   437→        const numCandles = 220;
+   438→   438→        const startPrice = this.spotPrices[symbol];
+   439→   439→        const config = UNDERLYING_CONFIG[symbol];
+   440→   440→        let price = startPrice * (1 + (this.rng() - 0.5) * 0.03); // start a bit off
+   441→   441→
+   442→   442→        // Use a separate deterministic rng for candles based on symbol+tf
+   443→   443→        const candleRng = mulberry32(
+   444→   444→          symbol === 'NIFTY' ? 1234 : 5678 + (tf === '1m' ? 0 : tf === '3m' ? 1 : tf === '5m' ? 2 : tf === '15m' ? 3 : 4)
+   445→   445→        );
+   446→   446→
+   447→   447→        for (let i = numCandles; i > 0; i--) {
+   448→   448→          const time = now - i * tfSeconds;
+   449→   449→          const open = price;
+   450→   450→          // Simulate intra-candle movement
+   451→   451→          const numSteps = tf === '1h' ? 60 : tf === '15m' ? 15 : tf === '5m' ? 5 : tf === '3m' ? 3 : 1;
+   452→   452→          let high = open;
+   453→   453→          let low = open;
+   454→   454→          let close = open;
+   455→   455→
+   456→   456→          for (let s = 0; s < numSteps; s++) {
+   457→   457→            const mu = 0.00002;
+   458→   458→            const dt = 1 / 252 / 375;
+   459→   459→            const sigma = config.volatility;
+   460→   460→            const z = normalRandom(candleRng);
+   461→   461→            const dS = mu * close * dt + sigma * close * Math.sqrt(dt) * z;
+   462→   462→            close = Math.max(close + dS, close * 0.98);
+   463→   463→            high = Math.max(high, close);
+   464→   464→            low = Math.min(low, close);
+   465→   465→          }
+   466→   466→
+   467→   467→          const volume = Math.floor(candleRng() * 200000) + 50000 +
+   468→   468→            Math.floor(Math.sin(i / 20) * 30000); // periodic volume pattern
+   469→   469→
+   470→   470→          candles.push({
+   471→   471→            time,
+   472→   472→            open: Math.round(open * 100) / 100,
+   473→   473→            high: Math.round(high * 100) / 100,
+   474→   474→            low: Math.round(low * 100) / 100,
+   475→   475→            close: Math.round(close * 100) / 100,
+   476→   476→            volume: Math.max(volume, 1000),
+   477→   477→          });
+   478→   478→
+   479→   479→          price = close;
+   480→   480→        }
+   481→   481→
+   482→   482→        // Make sure last candle aligns with current price
+   483→   483→        if (candles.length > 0) {
+   484→   484→          candles[candles.length - 1].close = Math.round(this.spotPrices[symbol] * 100) / 100;
+   485→   485→        }
+   486→   486→
+   487→   487→        this.candles[key] = candles;
+   488→   488→      }
+   489→   489→    }
+   490→   490→  }
+   491→   491→
+   492→   492→  // ============ OI Generation ============
+   493→   493→
+   494→   494→  private generateInitialOI(): void {
+   495→   495→    for (const [symbol, config] of Object.entries(UNDERLYING_CONFIG)) {
+   496→   496→      const spot = this.spotPrices[symbol];
+   497→   497→      const step = config.strikeStep;
+   498→   498→      const atm = Math.round(spot / step) * step;
+   499→   499→      const strikes = this.getStrikes(symbol, 10);
+   500→   500→
+   501→   501→      this.oiData[symbol] = {};
+   502→   502→      for (const strike of strikes) {
+   503→   503→        const distanceFromATM = Math.abs(strike - atm);
+   504→   504→        const roundBonus = strike % 1000 === 0 ? 1.5 : strike % 500 === 0 ? 1.2 : 1.0;
+   505→   505→        const baseOI = Math.floor(
+   506→   506→          (2_000_000 + this.rng() * 4_000_000) *
+   507→   507→          Math.exp(-distanceFromATM / (step * 15)) *
+   508→   508→          roundBonus
+   509→   509→        );
+   510→   510→
+   511→   511→        const ceChangeOi = Math.floor((this.rng() - 0.4) * 400_000);
+   512→   512→        const peChangeOi = Math.floor((this.rng() - 0.4) * 400_000);
+   513→   513→
+   514→   514→        this.oiData[symbol][strike] = {
+   515→   515→          ce_oi: baseOI + Math.floor(this.rng() * 1_000_000),
+   516→   516→          ce_change_oi: ceChangeOi,
+   517→   517→          pe_oi: baseOI + Math.floor(this.rng() * 1_000_000),
+   518→   518→          pe_change_oi: peChangeOi,
+   519→   519→        };
+   520→   520→      }
+   521→   521→    }
+   522→   522→  }
+   523→   523→
+   524→   524→  private updateOI(symbol: string): void {
+   525→   525→    const data = this.oiData[symbol];
+   526→   526→    if (!data) return;
+   527→   527→    for (const strike of Object.keys(data)) {
+   528→   528→      const s = Number(strike);
+   529→   529→      const d = data[s];
+   530→   530→      // Small random OI changes
+   531→   531→      d.ce_change_oi += Math.floor((this.rng() - 0.45) * 10_000);
+   532→   532→      d.pe_change_oi += Math.floor((this.rng() - 0.45) * 10_000);
+   533→   533→      d.ce_oi += Math.floor(this.rng() * 5_000);
+   534→   534→      d.pe_oi += Math.floor(this.rng() * 5_000);
+   535→   535→      // Clamp change OI to reasonable range
+   536→   536→      d.ce_change_oi = Math.max(-d.ce_oi, Math.min(d.ce_oi, d.ce_change_oi));
+   537→   537→      d.pe_change_oi = Math.max(-d.pe_oi, Math.min(d.pe_oi, d.pe_change_oi));
+   538→   538→    }
+   539→   539→  }
+   540→   540→
+   541→   541→  private getStrikes(symbol: string, numEachSide: number): number[] {
+   542→   542→    const config = UNDERLYING_CONFIG[symbol];
+   543→   543→    const spot = this.spotPrices[symbol];
+   544→   544→    const step = config.strikeStep;
+   545→   545→    const atm = Math.round(spot / step) * step;
+   546→   546→    const strikes: number[] = [];
+   547→   547→    for (let i = -numEachSide; i <= numEachSide; i++) {
+   548→   548→      strikes.push(atm + i * step);
+   549→   549→    }
+   550→   550→    return strikes;
+   551→   551→  }
+   552→   552→
+   553→   553→  // ============ PCR History ============
+   554→   554→
+   555→   555→  private generateInitialPCR(): void {
+   556→   556→    const now = Date.now();
+   557→   557→    for (const symbol of Object.keys(UNDERLYING_CONFIG)) {
+   558→   558→      const pcrPoints: PCRPoint[] = [];
+   559→   559→      let lastPcr = 0.9 + this.rng() * 0.3;
+   560→   560→      const baseSpot = this.spotPrices[symbol];
+   561→   561→      let spot = baseSpot * (1 + (this.rng() - 0.5) * 0.01);
+   562→   562→
+   563→   563→      for (let i = 60; i > 0; i--) {
+   564→   564→        const timestamp = now - i * 60_000; // 1-minute intervals
+   565→   565→        spot += (this.rng() - 0.5) * baseSpot * 0.001;
+   566→   566→        lastPcr += (this.rng() - 0.5) * 0.05;
+   567→   567→        lastPcr = Math.max(0.3, Math.min(2.5, lastPcr));
+   568→   568→        const change_pcr = (this.rng() - 0.5) * 0.1;
+   569→   569→
+   570→   570→        pcrPoints.push({
+   571→   571→          timestamp,
+   572→   572→          spot: Math.round(spot * 100) / 100,
+   573→   573→          pcr: Math.round(lastPcr * 1000) / 1000,
+   574→   574→          change_pcr: Math.round(change_pcr * 1000) / 1000,
+   575→   575→        });
+   576→   576→      }
+   577→   577→
+   578→   578→      this.pcrHistory[symbol] = pcrPoints;
+   579→   579→      this.lastPcr[symbol] = lastPcr;
+   580→   580→    }
+   581→   581→  }
+   582→   582→
+   583→   583→  // ============ Black-Scholes Pricing ============
+   584→   584→
+   585→   585→  private bsPrice(
+   586→   586→    S: number, K: number, T: number, sigma: number, type: 'CE' | 'PE'
+   587→   587→  ): { price: number; delta: number; gamma: number; theta: number; vega: number } {
+   588→   588→    if (T <= 0) {
+   589→   589→      // At expiry
+   590→   590→      const intrinsic = type === 'CE' ? Math.max(S - K, 0) : Math.max(K - S, 0);
+   591→   591→      return { price: intrinsic, delta: 0, gamma: 0, theta: 0, vega: 0 };
+   592→   592→    }
+   593→   593→
+   594→   594→    const r = RISK_FREE_RATE;
+   595→   595→    const sqrtT = Math.sqrt(T);
+   596→   596→    const d1 = (Math.log(S / K) + (r + (sigma * sigma) / 2) * T) / (sigma * sqrtT);
+   597→   597→    const d2 = d1 - sigma * sqrtT;
+   598→   598→
+   599→   599→    const nd1 = cdf(d1);
+   600→   600→    const nd2 = cdf(d2);
+   601→   601→    const nNd1 = cdf(-d1);
+   602→   602→    const nNd2 = cdf(-d2);
+   603→   603→    const npd1 = ndist(d1);
+   604→   604→
+   605→   605→    let price: number;
+   606→   606→    let delta: number;
+   607→   607→
+   608→   608→    if (type === 'CE') {
+   609→   609→      price = S * nd1 - K * Math.exp(-r * T) * nd2;
+   610→   610→      delta = nd1;
+   611→   611→    } else {
+   612→   612→      price = K * Math.exp(-r * T) * nNd2 - S * nNd1;
+   613→   613→      delta = nd1 - 1;
+   614→   614→    }
+   615→   615→
+   616→   616→    const gamma = npd1 / (S * sigma * sqrtT);
+   617→   617→    const theta = (
+   618→   618→      -(S * npd1 * sigma) / (2 * sqrtT) -
+   619→   619→      (type === 'CE' ? r * K * Math.exp(-r * T) * nd2 : -r * K * Math.exp(-r * T) * nNd2)
+   620→   620→    ) / 365;
+   621→   621→    const vega = (S * npd1 * sqrtT) / 100;
+   622→   622→
+   623→   623→    return {
+   624→   624→      price: Math.max(price, 0.05),
+   625→   625→      delta: Math.round(delta * 10000) / 10000,
+   626→   626→      gamma: Math.round(gamma * 1000000) / 1000000,
+   627→   627→      theta: Math.round(theta * 100) / 100,
+   628→   628→      vega: Math.round(vega * 100) / 100,
+   629→   629→    };
+   630→   630→  }
+   631→   631→
+   632→   632→  private getIV(strike: number, atm: number, baseIV: number): number {
+   633→   633→    // IV smile: higher IV for OTM options
+   634→   634→    const moneyness = (strike - atm) / atm;
+   635→   635→    const skew = moneyness * moneyness * 2; // quadratic smile
+   636→   636→    // Add slight negative skew (put IV > call IV)
+   637→   637→    const tilt = -moneyness * 0.05;
+   638→   638→    return Math.max(0.05, baseIV + skew + tilt + (this.rng() - 0.5) * 0.02);
+   639→   639→  }
+   640→   640→
+   641→   641→  // ============ Public API Methods ============
+   642→   642→
+   643→   643→  getCandles(instrumentKey: string, timeframe: string): CandleData[] {
+   644→   644→    // instrumentKey can be "NIFTY", "BANKNIFTY", or option key like "NSE_FO|NIFTY26062523500CE"
+   645→   645→    let symbol = instrumentKey;
+   646→   646→    if (instrumentKey.startsWith('NSE_FO|')) {
+   647→   647→      const parsed = this.parseInstrumentKeySimple(instrumentKey);
+   648→   648→      if (parsed) symbol = parsed.underlying;
+   649→   649→    }
+   650→   650→
+   651→   651→    const tf = TIMEFRAME_SECONDS[timeframe] ? timeframe : '1m';
+   652→   652→    const key = `${symbol}_${tf}`;
+   653→   653→    return this.candles[key] || [];
+   654→   654→  }
+   655→   655→
+   656→   656→  private parseInstrumentKeySimple(key: string): { underlying: string; expiry: string; strike: number; optionType: string } | null {
+   657→   657→    try {
+   658→   658→      const parts = key.split('|');
+   659→   659→      if (parts.length < 2) return null;
+   660→   660→      const body = parts[1];
+   661→   661→
+   662→   662→      let underlying = '';
+   663→   663→      let rest = body;
+   664→   664→      if (body.startsWith('BANKNIFTY')) {
+   665→   665→        underlying = 'BANKNIFTY';
+   666→   666→        rest = body.slice(9);
+   667→   667→      } else if (body.startsWith('NIFTY')) {
+   668→   668→        underlying = 'NIFTY';
+   669→   669→        rest = body.slice(5);
+   670→   670→      } else {
+   671→   671→        return null;
+   672→   672→      }
+   673→   673→
+   674→   674→      const optionType = rest.endsWith('CE') ? 'CE' : rest.endsWith('PE') ? 'PE' : '';
+   675→   675→      if (!optionType) return null;
+   676→   676→      rest = rest.slice(0, -2);
+   677→   677→
+   678→   678→      const strikeMatch = rest.match(/(\d+)$/);
+   679→   679→      if (!strikeMatch) return null;
+   680→   680→      const strike = parseInt(strikeMatch[1]);
+   681→   681→      const expiryPart = rest.slice(0, -strikeMatch[1].length);
+   682→   682→
+   683→   683→      const year = 2000 + parseInt(expiryPart.slice(0, 2));
+   684→   684→      const month = parseInt(expiryPart.slice(2, 4));
+   685→   685→      const day = parseInt(expiryPart.slice(4, 6));
+   686→   686→      const expiry = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+   687→   687→
+   688→   688→      return { underlying, expiry, strike, optionType };
+   689→   689→    } catch {
+   690→   690→      return null;
+   691→   691→    }
+   692→   692→  }
+   693→   693→
+   694→   694→  getOptionChain(underlying: string, expiry: string): {
+   695→   695→    underlying: string;
+   696→   696→    expiry: string;
+   697→   697→    spot_price: number;
+   698→   698→    atm_strike: number;
+   699→   699→    strike_step: number;
+   700→   700→    chain: OptionChainRow[];
+   701→   701→  } {
+   702→   702→    const config = UNDERLYING_CONFIG[underlying];
+   703→   703→    if (!config) {
+   704→   704→      return { underlying, expiry, spot_price: 0, atm_strike: 0, strike_step: 0, chain: [] };
+   705→   705→    }
+   706→   706→
+   707→   707→    const spot = this.getSpotPrice(underlying);
+   708→   708→    const step = config.strikeStep;
+   709→   709→    const atm = Math.round(spot / step) * step;
+   710→   710→    const strikes = this.getStrikes(underlying, 10);
+   711→   711→
+   712→   712→    // Parse expiry for time calculation
+   713→   713→    const T = this.timeToExpiry(expiry);
+   714→   714→    const baseIV = config.volatility;
+   715→   715→
+   716→   716→    const chain: OptionChainRow[] = strikes.map((strike) => {
+   717→   717→      const iv = this.getIV(strike, atm, baseIV);
+   718→   718→      const ceGreeks = this.bsPrice(spot, strike, T, iv, 'CE');
+   719→   719→      const peGreeks = this.bsPrice(spot, strike, T, iv, 'PE');
+   720→   720→      const oiInfo = this.oiData[underlying]?.[strike] || { ce_oi: 0, ce_change_oi: 0, pe_oi: 0, pe_change_oi: 0 };
+   721→   721→
+   722→   722→      const spread = Math.max(0.5, ceGreeks.price * 0.005);
+   723→   723→
+   724→   724→      return {
+   725→   725→        strike,
+   726→   726→        ce: {
+   727→   727→          instrument_key: `NSE_FO|${underlying}${compactExpiry(expiry)}${strike}CE`,
+   728→   728→          ltp: Math.round(ceGreeks.price * 100) / 100,
+   729→   729→          oi: oiInfo.ce_oi,
+   730→   730→          change_oi: oiInfo.ce_change_oi,
+   731→   731→          volume: Math.floor(this.rng() * 100_000) + 10_000,
+   732→   732→          iv: Math.round(iv * 100) / 100,
+   733→   733→          delta: ceGreeks.delta,
+   734→   734→          gamma: ceGreeks.gamma,
+   735→   735→          theta: ceGreeks.theta,
+   736→   736→          vega: ceGreeks.vega,
+   737→   737→          bid_price: Math.round((ceGreeks.price - spread / 2) * 100) / 100,
+   738→   738→          ask_price: Math.round((ceGreeks.price + spread / 2) * 100) / 100,
+   739→   739→        },
+   740→   740→        pe: {
+   741→   741→          instrument_key: `NSE_FO|${underlying}${compactExpiry(expiry)}${strike}PE`,
+   742→   742→          ltp: Math.round(peGreeks.price * 100) / 100,
+   743→   743→          oi: oiInfo.pe_oi,
+   744→   744→          change_oi: oiInfo.pe_change_oi,
+   745→   745→          volume: Math.floor(this.rng() * 100_000) + 10_000,
+   746→   746→          iv: Math.round(iv * 100) / 100,
+   747→   747→          delta: peGreeks.delta,
+   748→   748→          gamma: peGreeks.gamma,
+   749→   749→          theta: peGreeks.theta,
+   750→   750→          vega: peGreeks.vega,
+   751→   751→          bid_price: Math.round((peGreeks.price - spread / 2) * 100) / 100,
+   752→   752→          ask_price: Math.round((peGreeks.price + spread / 2) * 100) / 100,
+   753→   753→        },
+   754→   754→      };
+   755→   755→    });
+   756→   756→
+   757→   757→    return {
+   758→   758→      underlying,
+   759→   759→      expiry,
+   760→   760→      spot_price: Math.round(spot * 100) / 100,
+   761→   761→      atm_strike: atm,
+   762→   762→      strike_step: step,
+   763→   763→      chain,
+   764→   764→    };
+   765→   765→  }
+   766→   766→
+   767→   767→  getMiniOptionChain(underlying: string, expiry: string): {
+   768→   768→    underlying: string;
+   769→   769→    expiry: string;
+   770→   770→    spot_price: number;
+   771→   771→    atm_strike: number;
+   772→   772→    strike_step: number;
+   773→   773→    chain: MiniOptionChainRow[];
+   774→   774→  } {
+   775→   775→    const full = this.getOptionChain(underlying, expiry);
+   776→   776→    return {
+   777→   777→      underlying: full.underlying,
+   778→   778→      expiry: full.expiry,
+   779→   779→      spot_price: full.spot_price,
+   780→   780→      atm_strike: full.atm_strike,
+   781→   781→      strike_step: full.strike_step,
+   782→   782→      chain: full.chain.map((row) => ({
+   783→   783→        strike: row.strike,
+   784→   784→        ce: {
+   785→   785→          instrument_key: row.ce.instrument_key,
+   786→   786→          ltp: row.ce.ltp,
+   787→   787→          oi: row.ce.oi,
+   788→   788→          change_oi: row.ce.change_oi,
+   789→   789→          volume: row.ce.volume,
+   790→   790→          iv: row.ce.iv,
+   791→   791→          delta: row.ce.delta,
+   792→   792→          bid_price: row.ce.bid_price,
+   793→   793→          ask_price: row.ce.ask_price,
+   794→   794→        },
+   795→   795→        pe: {
+   796→   796→          instrument_key: row.pe.instrument_key,
+   797→   797→          ltp: row.pe.ltp,
+   798→   798→          oi: row.pe.oi,
+   799→   799→          change_oi: row.pe.change_oi,
+   800→   800→          volume: row.pe.volume,
+   801→   801→          iv: row.pe.iv,
+   802→   802→          delta: row.pe.delta,
+   803→   803→          bid_price: row.pe.bid_price,
+   804→   804→          ask_price: row.pe.ask_price,
+   805→   805→        },
+   806→   806→      })),
+   807→   807→    };
+   808→   808→  }
+   809→   809→
+   810→   810→  getOIData(underlying: string, expiry: string): {
+   811→   811→    underlying: string;
+   812→   812→    expiry: string;
+   813→   813→    spot_price: number;
+   814→   814→    data: OIDatum[];
+   815→   815→  } {
+   816→   816→    const config = UNDERLYING_CONFIG[underlying];
+   817→   817→    if (!config) return { underlying, expiry, spot_price: 0, data: [] };
+   818→   818→
+   819→   819→    const spot = this.getSpotPrice(underlying);
+   820→   820→    const strikes = this.getStrikes(underlying, 10);
+   821→   821→
+   822→   822→    const data: OIDatum[] = strikes.map((strike) => {
+   823→   823→      const oiInfo = this.oiData[underlying]?.[strike] || { ce_oi: 0, ce_change_oi: 0, pe_oi: 0, pe_change_oi: 0 };
+   824→   824→      return {
+   825→   825→        timestamp: Date.now(),
+   826→   826→        strike,
+   827→   827→        ce_oi: oiInfo.ce_oi,
+   828→   828→        ce_change_oi: oiInfo.ce_change_oi,
+   829→   829→        pe_oi: oiInfo.pe_oi,
+   830→   830→        pe_change_oi: oiInfo.pe_change_oi,
+   831→   831→      };
+   832→   832→    });
+   833→   833→
+   834→   834→    return { underlying, expiry, spot_price: Math.round(spot * 100) / 100, data };
+   835→   835→  }
+   836→   836→
+   837→   837→  getPCR(underlying: string, expiry: string): {
+   838→   838→    underlying: string;
+   839→   839→    expiry: string;
+   840→   840→    data: PCRPoint[];
+   841→   841→    current_pcr: number;
+   842→   842→    current_change_pcr: number;
+   843→   843→  } {
+   844→   844→    const history = this.pcrHistory[underlying] || [];
+   845→   845→    const currentPcr = history.length > 0 ? history[history.length - 1].pcr : 1.0;
+   846→   846→    const currentChange = history.length > 0 ? history[history.length - 1].change_pcr : 0;
+   847→   847→
+   848→   848→    return {
+   849→   849→      underlying,
+   850→   850→      expiry,
+   851→   851→      data: history,
+   852→   852→      current_pcr: Math.round(currentPcr * 1000) / 1000,
+   853→   853→      current_change_pcr: Math.round(currentChange * 1000) / 1000,
+   854→   854→    };
+   855→   855→  }
+   856→   856→
+   857→   857→  get7StrikeMatrix(underlying: string, expiry: string): SevenStrikeMatrix {
+   858→   858→    const config = UNDERLYING_CONFIG[underlying];
+   859→   859→    if (!config) {
+   860→   860→      return { underlying, expiry, spot_price: 0, atm_strike: 0, strike_step: 0, window_strikes: [], rows: [], ce_coi_sum: 0, pe_coi_sum: 0, coi_pcr: 1, state: 'IDLE' };
+   861→   861→    }
+   862→   862→
+   863→   863→    const spot = this.getSpotPrice(underlying);
+   864→   864→    const step = config.strikeStep;
+   865→   865→    const atm = Math.round(spot / step) * step;
+   866→   866→
+   867→   867→    // 7-strike window: ATM ±3
+   868→   868→    const windowStrikes: number[] = [];
+   869→   869→    for (let i = -3; i <= 3; i++) {
+   870→   870→      windowStrikes.push(atm + i * step);
+   871→   871→    }
+   872→   872→
+   873→   873→    const rows: SevenStrikeRow[] = windowStrikes.map((strike) => {
+   874→   874→      const oiInfo = this.oiData[underlying]?.[strike] || { ce_oi: 0, ce_change_oi: 0, pe_oi: 0, pe_change_oi: 0 };
+   875→   875→      return {
+   876→   876→        strike,
+   877→   877→        ce_coi: oiInfo.ce_change_oi,
+   878→   878→        pe_coi: oiInfo.pe_change_oi,
+   879→   879→        ce_oi: oiInfo.ce_oi,
+   880→   880→        pe_oi: oiInfo.pe_oi,
+   881→   881→      };
+   882→   882→    });
+   883→   883→
+   884→   884→    const ceCoiSum = rows.reduce((sum, r) => sum + r.ce_coi, 0);
+   885→   885→    const peCoiSum = rows.reduce((sum, r) => sum + r.pe_coi, 0);
+   886→   886→    const coiPcr = ceCoiSum !== 0 ? peCoiSum / ceCoiSum : 1;
+   887→   887→
+   888→   888→    // State determination
+   889→   889→    let state = 'IDLE';
+   890→   890→    if (coiPcr > 1.5 || coiPcr < 0.6) {
+   891→   891→      state = 'ACTIVE';
+   892→   892→    } else if (coiPcr > 1.2 || coiPcr < 0.8) {
+   893→   893→      state = 'ZONE_WATCH';
+   894→   894→    }
+   895→   895→
+   896→   896→    this.lastState[underlying] = state;
+   897→   897→    this.lastPcr[underlying] = coiPcr;
+   898→   898→
+   899→   899→    return {
+   900→   900→      underlying,
+   901→   901→      expiry,
+   902→   902→      spot_price: Math.round(spot * 100) / 100,
+   903→   903→      atm_strike: atm,
+   904→   904→      strike_step: step,
+   905→   905→      window_strikes: windowStrikes,
+   906→   906→      rows,
+   907→   907→      ce_coi_sum: ceCoiSum,
+   908→   908→      pe_coi_sum: peCoiSum,
+   909→   909→      coi_pcr: Math.round(coiPcr * 1000) / 1000,
+   910→   910→      state,
+   911→   911→    };
+   912→   912→  }
+   913→   913→
+   914→   914→  get7StrikeSignals(underlying: string, expiry: string): SevenStrikeSignals {
+   915→   915→    const matrix = this.get7StrikeMatrix(underlying, expiry);
+   916→   916→    const coiPcr = matrix.coi_pcr;
+   917→   917→    const state = matrix.state;
+   918→   918→
+   919→   919→    // Generate signals based on COI PCR
+   920→   920→    const signals = this.signalHistory[underlying] || [];
+   921→   921→
+   922→   922→    // Determine signal
+   923→   923→    let signalType = 'NEUTRAL';
+   924→   924→    let confidence = 0;
+   925→   925→    let reason = 'No significant COI PCR divergence';
+   926→   926→    let gateCondition: string | null = null;
+   927→   927→    let volumePercent: number | null = null;
+   928→   928→
+   929→   929→    if (coiPcr > 1.5) {
+   930→   930→      signalType = 'LONG';
+   931→   931→      confidence = Math.min(0.95, 0.5 + (coiPcr - 1.5) * 0.3 + this.rng() * 0.1);
+   932→   932→      reason = `Strong PE COI buildup (PCR: ${coiPcr.toFixed(3)}) suggests bearish resistance, bullish signal`;
+   933→   933→      gateCondition = 'LONG';
+   934→   934→      volumePercent = 75 + this.rng() * 20;
+   935→   935→    } else if (coiPcr > 1.2) {
+   936→   936→      signalType = 'LONG';
+   937→   937→      confidence = Math.min(0.7, 0.3 + (coiPcr - 1.2) * 0.5 + this.rng() * 0.1);
+   938→   938→      reason = `Moderate PE COI dominance (PCR: ${coiPcr.toFixed(3)}), watch for confirmation`;
+   939→   939→      gateCondition = 'LONG';
+   940→   940→    } else if (coiPcr < 0.6) {
+   941→   941→      signalType = 'SHORT';
+   942→   942→      confidence = Math.min(0.95, 0.5 + (0.6 - coiPcr) * 0.3 + this.rng() * 0.1);
+   943→   943→      reason = `Strong CE COI buildup (PCR: ${coiPcr.toFixed(3)}) suggests bullish resistance, bearish signal`;
+   944→   944→      gateCondition = 'SHORT';
+   945→   945→      volumePercent = 75 + this.rng() * 20;
+   946→   946→    } else if (coiPcr < 0.8) {
+   947→   947→      signalType = 'SHORT';
+   948→   948→      confidence = Math.min(0.7, 0.3 + (0.8 - coiPcr) * 0.5 + this.rng() * 0.1);
+   949→   949→      reason = `Moderate CE COI dominance (PCR: ${coiPcr.toFixed(3)}), watch for confirmation`;
+   950→   950→      gateCondition = 'SHORT';
+   951→   951→    }
+   952→   952→
+   953→   953→    const currentSignal: Signal = {
+   954→   954→      signal_type: signalType,
+   955→   955→      confidence: Math.round(confidence * 1000) / 1000,
+   956→   956→      reason,
+   957→   957→      timestamp: Date.now(),
+   958→   958→      spot_price: matrix.spot_price,
+   959→   959→      coi_pcr: coiPcr,
+   960→   960→      volume_percent: volumePercent,
+   961→   961→      gate_condition: gateCondition,
+   962→   962→      pain_index: coiPcr > 1 ? matrix.atm_strike + (coiPcr - 1) * 50 : matrix.atm_strike - (1 - coiPcr) * 50,
+   963→   963→    };
+   964→   964→
+   965→   965→    // Add to history if different from last
+   966→   966→    if (signals.length === 0 || signals[signals.length - 1].signal_type !== signalType) {
+   967→   967→      signals.push(currentSignal);
+   968→   968→      if (signals.length > 50) signals.shift();
+   969→   969→      this.signalHistory[underlying] = signals;
+   970→   970→    }
+   971→   971→
+   972→   972→    return {
+   973→   973→      underlying,
+   974→   974→      expiry,
+   975→   975→      signals,
+   976→   976→      current_signal: currentSignal,
+   977→   977→      gate_condition: gateCondition || 'NONE',
+   978→   978→      state,
+   979→   979→    };
+   980→   980→  }
+   981→   981→
+   982→   982→  searchInstruments(query: string): Instrument[] {
+   983→   983→    const q = query.toUpperCase().trim();
+   984→   984→    const results: Instrument[] = [];
+   985→   985→
+   986→   986→    // Parse human-readable query like "NIFTY 23900 CE 25 Jun 2026"
+   987→   987→    // Extract: underlying, strike, optionType, expiry parts
+   988→   988→    const parts = q.split(/\s+/);
+   989→   989→    let searchUnderlying = '';
+   990→   990→    let searchStrike: number | null = null;
+   991→   991→    let searchOptionType = '';
+   992→   992→    const monthNames = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+   993→   993→
+   994→   994→    for (const part of parts) {
+   995→   995→      if (part === 'NIFTY' || part === 'NIFTY50') searchUnderlying = 'NIFTY';
+   996→   996→      else if (part === 'BANKNIFTY' || part === 'BANK' || part === 'BNF') searchUnderlying = 'BANKNIFTY';
+   997→   997→      else if (part === 'CE' || part === 'PE') searchOptionType = part;
+   998→   998→      else if (/^\d{3,5}$/.test(part)) searchStrike = parseInt(part);
+   999→   999→    }
+  1000→  1000→
+  1001→  1001→    // If no underlying detected, try to match from full query
+  1002→  1002→    if (!searchUnderlying) {
+  1003→  1003→      if (q.includes('NIFTY') && !q.includes('BANK')) searchUnderlying = 'NIFTY';
+  1004→  1004→      else if (q.includes('BANKNIFTY') || q.includes('BNF')) searchUnderlying = 'BANKNIFTY';
+  1005→  1005→    }
+  1006→  1006→
+  1007→  1007→    // Search across all expiries
+  1008→  1008→    const expiries = nextThursdays(6);
+  1009→  1009→
+  1010→  1010→    for (const [symbol, config] of Object.entries(UNDERLYING_CONFIG)) {
+  1011→  1011→      // If specific underlying requested, skip others
+  1012→  1012→      if (searchUnderlying && symbol !== searchUnderlying) continue;
+  1013→  1013→      // If no specific underlying, match by query containing symbol name
+  1014→  1014→      if (!searchUnderlying && !q.includes(symbol) && !config.displayName.toUpperCase().includes(q)) continue;
+  1015→  1015→
+  1016→  1016→      // Add index
+  1017→  1017→      results.push({
+  1018→  1018→        instrument_key: `NSE_INDEX|${symbol}`,
+  1019→  1019→        name: config.displayName,
+  1020→  1020→        underlying: symbol,
+  1021→  1021→        type: 'INDEX',
+  1022→  1022→      });
+  1023→  1023→
+  1024→  1024→      // Add options for each expiry
+  1025→  1025→      for (const expiryDate of expiries) {
+  1026→  1026→        const expiry = formatExpiryDate(expiryDate);
+  1027→  1027→        const expiryCompact = compactExpiry(expiry);
+  1028→  1028→        const expiryLabel = formatDateLabel(expiryDate);
+  1029→  1029→
+  1030→  1030→        // Add futures
+  1031→  1031→        results.push({
+  1032→  1032→          instrument_key: `NSE_FO|${symbol}${expiryCompact}FUT`,
+  1033→  1033→          name: `${symbol} ${expiryLabel} FUT`,
+  1034→  1034→          underlying: symbol,
+  1035→  1035→          type: 'FUT',
+  1036→  1036→          expiry,
+  1037→  1037→        });
+  1038→  1038→
+  1039→  1039→        // Options
+  1040→  1040→        const spot = this.getSpotPrice(symbol);
+  1041→  1041→        const step = config.strikeStep;
+  1042→  1042→        const atm = Math.round(spot / step) * step;
+  1043→  1043→        const range = searchStrike ? 3 : 5; // Narrower range if specific strike
+  1044→  1044→        const baseStrike = searchStrike || atm;
+  1045→  1045→
+  1046→  1046→        for (let i = -range; i <= range; i++) {
+  1047→  1047→          const strike = baseStrike + i * step;
+  1048→  1048→          if (strike <= 0) continue;
+  1049→  1049→          for (const optType of ['CE', 'PE'] as const) {
+  1050→  1050→            // If specific option type requested, skip others
+  1051→  1051→            if (searchOptionType && optType !== searchOptionType) continue;
+  1052→  1052→
+  1053→  1053→            const key = `NSE_FO|${symbol}${expiryCompact}${strike}${optType}`;
+  1054→  1054→            results.push({
+  1055→  1055→              instrument_key: key,
+  1056→  1056→              name: `${symbol} ${strike} ${optType}`,
+  1057→  1057→              underlying: symbol,
+  1058→  1058→              type: optType,
+  1059→  1059→              expiry,
+  1060→  1060→              strike,
+  1061→  1061→              display_name: `${symbol} ${strike} ${optType} ${expiryLabel}`,
+  1062→  1062→            });
+  1063→  1063→          }
+  1064→  1064→        }
+  1065→  1065→      }
+  1066→  1066→    }
+  1067→  1067→
+  1068→  1068→    return results.slice(0, 30);
+  1069→  1069→  }
+  1070→  1070→
+  1071→  1071→  getExpiries(underlying: string): ExpiryInfo[] {
+  1072→  1072→    const thursdays = nextThursdays(6);
+  1073→  1073→    const now = new Date();
+  1074→  1074→    return thursdays.map((d) => {
+  1075→  1075→      const diffDays = Math.ceil((d.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+  1076→  1076→      return {
+  1077→  1077→        expiry_date: formatExpiryDate(d),
+  1078→  1078→        expiry_label: formatDateLabel(d),
+  1079→  1079→        is_weekly: true,
+  1080→  1080→        days_to_expiry: diffDays,
+  1081→  1081→      };
+  1082→  1082→    });
+  1083→  1083→  }
+  1084→  1084→
+  1085→  1085→  getReplaySessions(): Array<{
+  1086→  1086→    session_id: string;
+  1087→  1087→    underlying: string;
+  1088→  1088→    start_time: string;
+  1089→  1089→    end_time: string;
+  1090→  1090→    candle_count: number;
+  1091→  1091→  }> {
+  1092→  1092→    return [
+  1093→  1093→      {
+  1094→  1094→        session_id: 'demo-session-1',
+  1095→  1095→        underlying: 'NIFTY',
+  1096→  1096→        start_time: new Date(Date.now() - 3600000).toISOString(),
+  1097→  1097→        end_time: new Date().toISOString(),
+  1098→  1098→        candle_count: 60,
+  1099→  1099→      },
+  1100→  1100→      {
+  1101→  1101→        session_id: 'demo-session-2',
+  1102→  1102→        underlying: 'BANKNIFTY',
+  1103→  1103→        start_time: new Date(Date.now() - 7200000).toISOString(),
+  1104→  1104→        end_time: new Date(Date.now() - 3600000).toISOString(),
+  1105→  1105→        candle_count: 120,
+  1106→  1106→      },
+  1107→  1107→    ];
+  1108→  1108→  }
+  1109→  1109→
+  1110→  1110→  startReplay(sessionId: string): {
+  1111→  1111→    session_id: string;
+  1112→  1112→    status: string;
+  1113→  1113→    message: string;
+  1114→  1114→  } {
+  1115→  1115→    return {
+  1116→  1116→      session_id: sessionId,
+  1117→  1117→      status: 'started',
+  1118→  1118→      message: `Replay session ${sessionId} started. Data will be emitted via WebSocket.`,
+  1119→  1119→    };
+  1120→  1120→  }
+  1121→  1121→
+  1122→  1122→  getHealth(): {
+  1123→  1123→    status: string;
+  1124→  1124→    uptime: number;
+  1125→  1125→    symbols: string[];
+  1126→  1126→    tick_count: number;
+  1127→  1127→    timestamp: number;
+  1128→  1128→  } {
+  1129→  1129→    return {
+  1130→  1130→      status: 'ok',
+  1131→  1131→      uptime: process.uptime(),
+  1132→  1132→      symbols: Object.keys(UNDERLYING_CONFIG),
+  1133→  1133→      tick_count: this.tickCount,
+  1134→  1134→      timestamp: Date.now(),
+  1135→  1135→    };
+  1136→  1136→  }
+  1137→  1137→
+  1138→  1138→  // ============ 7-Strike History Generation ============
+  1139→  1139→
+  1140→  1140→  private generate7StrikeHistory(): void {
+  1141→  1141→    const now = Date.now();
+  1142→  1142→    for (const symbol of Object.keys(UNDERLYING_CONFIG)) {
+  1143→  1143→      const config = UNDERLYING_CONFIG[symbol];
+  1144→  1144→      const step = config.strikeStep;
+  1145→  1145→      const baseSpot = this.spotPrices[symbol];
+  1146→  1146→
+  1147→  1147→      // Initialize arrays
+  1148→  1148→      this.coiPcrHistory[symbol] = [];
+  1149→  1149→      this.volumeProxyHistory[symbol] = [];
+  1150→  1150→      this.trapClustersData[symbol] = [];
+  1151→  1151→      this.tradeSuggestions[symbol] = [];
+  1152→  1152→      this.lastATMStrike[symbol] = Math.round(baseSpot / step) * step;
+  1153→  1153→      this.stabilizationUntil[symbol] = 0;
+  1154→  1154→      this.lastSignalType[symbol] = 'NEUTRAL';
+  1155→  1155→      this.gateConditionActive[symbol] = null;
+  1156→  1156→
+  1157→  1157→      // Use a separate deterministic rng for history generation
+  1158→  1158→      const histRng = mulberry32(symbol === 'NIFTY' ? 9876 : 5432);
+  1159→  1159→      let spot = baseSpot * (1 + (histRng() - 0.5) * 0.005);
+  1160→  1160→      let lastPcr = 0.9 + histRng() * 0.3;
+  1161→  1161→      let lastSignal = 'NEUTRAL';
+  1162→  1162→      let gateActive: { type: 'LONG' | 'SHORT'; since: number } | null = null;
+  1163→  1163→      const prevATM = Math.round(spot / step) * step;
+  1164→  1164→
+  1165→  1165→      for (let i = 120; i > 0; i--) {
+  1166→  1166→        const timestamp = now - i * 60_000; // 1-minute intervals
+  1167→  1167→
+  1168→  1168→        // Simulate spot movement
+  1169→  1169→        spot += (histRng() - 0.5) * baseSpot * 0.001;
+  1170→  1170→        const currentATM = Math.round(spot / step) * step;
+  1171→  1171→
+  1172→  1172→        // Check for ATM shift
+  1173→  1173→        if (currentATM !== prevATM) {
+  1174→  1174→          this.stabilizationUntil[symbol] = timestamp + 120_000; // 2-min stabilization
+  1175→  1175→        }
+  1176→  1176→
+  1177→  1177→        // Generate COI PCR values
+  1178→  1178→        const ceCoiBase = Math.floor((histRng() - 0.4) * 400_000);
+  1179→  1179→        const peCoiBase = Math.floor((histRng() - 0.4) * 400_000);
+  1180→  1180→        const ceCoiSum = ceCoiBase + Math.floor(histRng() * 200_000);
+  1181→  1181→        const peCoiSum = peCoiBase + Math.floor(histRng() * 200_000);
+  1182→  1182→
+  1183→  1183→        lastPcr += (histRng() - 0.5) * 0.04;
+  1184→  1184→        lastPcr = Math.max(0.3, Math.min(2.5, lastPcr));
+  1185→  1185→        const coiPcr = ceCoiSum !== 0 ? peCoiSum / ceCoiSum : 1;
+  1186→  1186→
+  1187→  1187→        // Determine state
+  1188→  1188→        let state = 'IDLE';
+  1189→  1189→        if (coiPcr > 1.5 || coiPcr < 0.6) {
+  1190→  1190→          state = 'ACTIVE';
+  1191→  1191→        } else if (coiPcr > 1.2 || coiPcr < 0.8) {
+  1192→  1192→          state = 'ZONE_WATCH';
+  1193→  1193→        }
+  1194→  1194→
+  1195→  1195→        // Determine signal type
+  1196→  1196→        let signalType = 'NEUTRAL';
+  1197→  1197→        let confidence = 0;
+  1198→  1198→        if (coiPcr > 1.5) {
+  1199→  1199→          signalType = 'LONG';
+  1200→  1200→          confidence = Math.min(0.95, 0.5 + (coiPcr - 1.5) * 0.3 + histRng() * 0.1);
+  1201→  1201→        } else if (coiPcr > 1.2) {
+  1202→  1202→          signalType = 'LONG';
+  1203→  1203→          confidence = Math.min(0.7, 0.3 + (coiPcr - 1.2) * 0.5 + histRng() * 0.1);
+  1204→  1204→        } else if (coiPcr < 0.6) {
+  1205→  1205→          signalType = 'SHORT';
+  1206→  1206→          confidence = Math.min(0.95, 0.5 + (0.6 - coiPcr) * 0.3 + histRng() * 0.1);
+  1207→  1207→        } else if (coiPcr < 0.8) {
+  1208→  1208→          signalType = 'SHORT';
+  1209→  1209→          confidence = Math.min(0.7, 0.3 + (0.8 - coiPcr) * 0.5 + histRng() * 0.1);
+  1210→  1210→        }
+  1211→  1211→
+  1212→  1212→        // Track gate condition
+  1213→  1213→        if (signalType === 'LONG' || signalType === 'SHORT') {
+  1214→  1214→          if (!gateActive || gateActive.type !== signalType) {
+  1215→  1215→            gateActive = { type: signalType as 'LONG' | 'SHORT', since: timestamp };
+  1216→  1216→          }
+  1217→  1217→        } else {
+  1218→  1218→          gateActive = null;
+  1219→  1219→        }
+  1220→  1220→
+  1221→  1221→        // Add COI PCR point
+  1222→  1222→        this.coiPcrHistory[symbol].push({
+  1223→  1223→          timestamp,
+  1224→  1224→          coi_pcr: Math.round(coiPcr * 1000) / 1000,
+  1225→  1225→          spot: Math.round(spot * 100) / 100,
+  1226→  1226→          ce_coi_sum: ceCoiSum,
+  1227→  1227→          pe_coi_sum: peCoiSum,
+  1228→  1228→          state,
+  1229→  1229→          signal_type: signalType,
+  1230→  1230→          confidence: Math.round(confidence * 1000) / 1000,
+  1231→  1231→        });
+  1232→  1232→
+  1233→  1233→        // Generate volume proxy
+  1234→  1234→        let volumePercent = 0.5 + histRng() * 3;
+  1235→  1235→        // Occasional spikes
+  1236→  1236→        if (histRng() < 0.05) {
+  1237→  1237→          volumePercent = 5 + histRng() * 3; // spike
+  1238→  1238→        }
+  1239→  1239→        const classification: VolumeProxyPoint['classification'] =
+  1240→  1240→          volumePercent >= 5 ? 'EXTREME' :
+  1241→  1241→          volumePercent >= 3 ? 'HIGH' :
+  1242→  1242→          volumePercent >= 1.5 ? 'ELEVATED' : 'NORMAL';
+  1243→  1243→
+  1244→  1244→        this.volumeProxyHistory[symbol].push({
+  1245→  1245→          timestamp,
+  1246→  1246→          volume_percent: Math.round(volumePercent * 100) / 100,
+  1247→  1247→          classification,
+  1248→  1248→          spot: Math.round(spot * 100) / 100,
+  1249→  1249→        });
+  1250→  1250→
+  1251→  1251→        // Check for trap clusters when volume is HIGH or EXTREME
+  1252→  1252→        if (volumePercent >= 3.0) {
+  1253→  1253→          const direction: TrapCluster['direction'] = signalType === 'LONG' ? 'BEARISH_TRAP' : signalType === 'SHORT' ? 'BULLISH_TRAP' : (histRng() > 0.5 ? 'BULLISH_TRAP' : 'BEARISH_TRAP');
+  1254→  1254→          const painIndex = direction === 'BULLISH_TRAP'
+  1255→  1255→            ? currentATM + Math.floor(histRng() * 4) * step
+  1256→  1256→            : currentATM - Math.floor(histRng() * 4) * step;
+  1257→  1257→
+  1258→  1258→          this.trapClustersData[symbol].push({
+  1259→  1259→            id: `trap_${symbol}_${timestamp}`,
+  1260→  1260→            price_high: currentATM + step,
+  1261→  1261→            price_low: currentATM - step,
+  1262→  1262→            timestamp_start: timestamp,
+  1263→  1263→            volume_trapped: Math.floor(volumePercent * 100_000),
+  1264→  1264→            direction,
+  1265→  1265→            pain_index: painIndex,
+  1266→  1266→            active: i <= 5, // Only last 5 are still active
+  1267→  1267→            triggered: i > 5, // Older ones are triggered
+  1268→  1268→          });
+  1269→  1269→        }
+  1270→  1270→
+  1271→  1271→        // Generate trade suggestions for significant signals
+  1272→  1272→        if ((signalType === 'LONG' || signalType === 'SHORT') && confidence > 0.6 && i % 15 === 0) {
+  1273→  1273→          const lotSize = symbol === 'BANKNIFTY' ? 15 : 25;
+  1274→  1274→          const entryStrike = currentATM;
+  1275→  1275→
+  1276→  1276→          // Option buying: SL below entry, target above entry
+  1277→  1277→          const slPct = confidence > 0.8 ? 0.30 : 0.40;
+  1278→  1278→          const targetPct = confidence > 0.8 ? 1.50 : 1.00;
+  1279→  1279→
+  1280→  1280→          let entry_price: number, stop_loss: number, target: number, option_suggestion: string;
+  1281→  1281→
+  1282→  1282→          if (signalType === 'LONG') {
+  1283→  1283→            const T = 7 / 365;
+  1284→  1284→            const iv = config.volatility;
+  1285→  1285→            const ceGreeks = this.bsPrice(spot, entryStrike, T, iv, 'CE');
+  1286→  1286→            entry_price = Math.round(ceGreeks.price * 100) / 100;
+  1287→  1287→            stop_loss = Math.max(0.05, Math.round(entry_price * (1 - slPct) * 100) / 100);
+  1288→  1288→            target = Math.round(entry_price * (1 + targetPct) * 100) / 100;
+  1289→  1289→            option_suggestion = `BUY ${symbol} ${entryStrike} CE (Lot: ${lotSize})`;
+  1290→  1290→          } else {
+  1291→  1291→            const T = 7 / 365;
+  1292→  1292→            const iv = config.volatility;
+  1293→  1293→            const peGreeks = this.bsPrice(spot, entryStrike, T, iv, 'PE');
+  1294→  1294→            entry_price = Math.round(peGreeks.price * 100) / 100;
+  1295→  1295→            stop_loss = Math.max(0.05, Math.round(entry_price * (1 - slPct) * 100) / 100);
+  1296→  1296→            target = Math.round(entry_price * (1 + targetPct) * 100) / 100;
+  1297→  1297→            option_suggestion = `BUY ${symbol} ${entryStrike} PE (Lot: ${lotSize})`;
+  1298→  1298→          }
+  1299→  1299→
+  1300→  1300→          const risk = entry_price - stop_loss;
+  1301→  1301→          const reward = target - entry_price;
+  1302→  1302→          const rrRatio = risk > 0 ? (reward / risk).toFixed(1) : '0.0';
+  1303→  1303→
+  1304→  1304→          this.tradeSuggestions[symbol].push({
+  1305→  1305→            id: `trade_${symbol}_${timestamp}`,
+  1306→  1306→            signal_type: signalType as 'LONG' | 'SHORT',
+  1307→  1307→            entry_price,
+  1308→  1308→            stop_loss,
+  1309→  1309→            target,
+  1310→  1310→            risk_reward: `1:${rrRatio}`,
+  1311→  1311→            confidence: Math.round(confidence * 1000) / 1000,
+  1312→  1312→            reason: signalType === 'LONG'
+  1313→  1313→              ? `Strong PE COI buildup (PCR: ${coiPcr.toFixed(3)}) — bullish signal`
+  1314→  1314→              : `Strong CE COI buildup (PCR: ${coiPcr.toFixed(3)}) — bearish signal`,
+  1315→  1315→            timestamp,
+  1316→  1316→            spot_price: Math.round(spot * 100) / 100,
+  1317→  1317→            coi_pcr: Math.round(coiPcr * 1000) / 1000,
+  1318→  1318→            status: i > 10 ? 'HIT_TARGET' : 'ACTIVE',
+  1319→  1319→            option_suggestion,
+  1320→  1320→            exit_reason: i > 10 ? 'Target achieved' : null,
+  1321→  1321→          });
+  1322→  1322→        }
+  1323→  1323→
+  1324→  1324→        lastSignal = signalType;
+  1325→  1325→      }
+  1326→  1326→
+  1327→  1327→      this.lastATMStrike[symbol] = prevATM;
+  1328→  1328→      this.lastSignalType[symbol] = lastSignal;
+  1329→  1329→      this.gateConditionActive[symbol] = gateActive;
+  1330→  1330→    }
+  1331→  1331→  }
+  1332→  1332→
+  1333→  1333→  // ============ 7-Strike COI PCR History Update ============
+  1334→  1334→
+  1335→  1335→  updateCOIPCRHistory(underlying: string): void {
+  1336→  1336→    const config = UNDERLYING_CONFIG[underlying];
+  1337→  1337→    if (!config) return;
+  1338→  1338→
+  1339→  1339→    const matrix = this.get7StrikeMatrix(underlying, '');
+  1340→  1340→    const spot = matrix.spot_price;
+  1341→  1341→    const step = matrix.strike_step;
+  1342→  1342→    const currentATM = matrix.atm_strike;
+  1343→  1343→
+  1344→  1344→    // Check for ATM shift — add stabilization
+  1345→  1345→    const prevATM = this.lastATMStrike[underlying] || currentATM;
+  1346→  1346→    if (currentATM !== prevATM) {
+  1347→  1347→      this.stabilizationUntil[underlying] = Date.now() + 120_000; // 2-min stabilization
+  1348→  1348→      this.lastATMStrike[underlying] = currentATM;
+  1349→  1349→    }
+  1350→  1350→
+  1351→  1351→    // Determine signal from current matrix
+  1352→  1352→    const coiPcr = matrix.coi_pcr;
+  1353→  1353→    let signalType = 'NEUTRAL';
+  1354→  1354→    let confidence = 0;
+  1355→  1355→    if (coiPcr > 1.5) {
+  1356→  1356→      signalType = 'LONG';
+  1357→  1357→      confidence = Math.min(0.95, 0.5 + (coiPcr - 1.5) * 0.3 + this.rng() * 0.1);
+  1358→  1358→    } else if (coiPcr > 1.2) {
+  1359→  1359→      signalType = 'LONG';
+  1360→  1360→      confidence = Math.min(0.7, 0.3 + (coiPcr - 1.2) * 0.5 + this.rng() * 0.1);
+  1361→  1361→    } else if (coiPcr < 0.6) {
+  1362→  1362→      signalType = 'SHORT';
+  1363→  1363→      confidence = Math.min(0.95, 0.5 + (0.6 - coiPcr) * 0.3 + this.rng() * 0.1);
+  1364→  1364→    } else if (coiPcr < 0.8) {
+  1365→  1365→      signalType = 'SHORT';
+  1366→  1366→      confidence = Math.min(0.7, 0.3 + (0.8 - coiPcr) * 0.5 + this.rng() * 0.1);
+  1367→  1367→    }
+  1368→  1368→
+  1369→  1369→    // Update gate condition tracking
+  1370→  1370→    if (signalType === 'LONG' || signalType === 'SHORT') {
+  1371→  1371→      if (!this.gateConditionActive[underlying] || this.gateConditionActive[underlying]?.type !== signalType) {
+  1372→  1372→        this.gateConditionActive[underlying] = { type: signalType as 'LONG' | 'SHORT', since: Date.now() };
+  1373→  1373→      }
+  1374→  1374→    } else {
+  1375→  1375→      this.gateConditionActive[underlying] = null;
+  1376→  1376→    }
+  1377→  1377→
+  1378→  1378→    const point: COIPCRPoint = {
+  1379→  1379→      timestamp: Date.now(),
+  1380→  1380→      coi_pcr: coiPcr,
+  1381→  1381→      spot,
+  1382→  1382→      ce_coi_sum: matrix.ce_coi_sum,
+  1383→  1383→      pe_coi_sum: matrix.pe_coi_sum,
+  1384→  1384→      state: matrix.state,
+  1385→  1385→      signal_type: signalType,
+  1386→  1386→      confidence: Math.round(confidence * 1000) / 1000,
+  1387→  1387→    };
+  1388→  1388→
+  1389→  1389→    if (!this.coiPcrHistory[underlying]) this.coiPcrHistory[underlying] = [];
+  1390→  1390→    this.coiPcrHistory[underlying].push(point);
+  1391→  1391→
+  1392→  1392→    // Keep max 300 points
+  1393→  1393→    if (this.coiPcrHistory[underlying].length > 300) {
+  1394→  1394→      this.coiPcrHistory[underlying].shift();
+  1395→  1395→    }
+  1396→  1396→
+  1397→  1397→    this.lastSignalType[underlying] = signalType;
+  1398→  1398→  }
+  1399→  1399→
+  1400→  1400→  // ============ Volume Proxy Update ============
+  1401→  1401→
+  1402→  1402→  updateVolumeProxy(underlying: string): void {
+  1403→  1403→    const config = UNDERLYING_CONFIG[underlying];
+  1404→  1404→    if (!config) return;
+  1405→  1405→
+  1406→  1406→    const spot = this.getSpotPrice(underlying);
+  1407→  1407→    const step = config.strikeStep;
+  1408→  1408→    const atm = Math.round(spot / step) * step;
+  1409→  1409→
+  1410→  1410→    // Simulate volume_percent
+  1411→  1411→    let volumePercent = 0.5 + this.rng() * 3;
+  1412→  1412→    // Occasional spikes (5% chance)
+  1413→  1413→    if (this.rng() < 0.05) {
+  1414→  1414→      volumePercent = 5 + this.rng() * 3;
+  1415→  1415→    }
+  1416→  1416→
+  1417→  1417→    const classification: VolumeProxyPoint['classification'] =
+  1418→  1418→      volumePercent >= 5 ? 'EXTREME' :
+  1419→  1419→      volumePercent >= 3 ? 'HIGH' :
+  1420→  1420→      volumePercent >= 1.5 ? 'ELEVATED' : 'NORMAL';
+  1421→  1421→
+  1422→  1422→    const point: VolumeProxyPoint = {
+  1423→  1423→      timestamp: Date.now(),
+  1424→  1424→      volume_percent: Math.round(volumePercent * 100) / 100,
+  1425→  1425→      classification,
+  1426→  1426→      spot: Math.round(spot * 100) / 100,
+  1427→  1427→    };
+  1428→  1428→
+  1429→  1429→    if (!this.volumeProxyHistory[underlying]) this.volumeProxyHistory[underlying] = [];
+  1430→  1430→    this.volumeProxyHistory[underlying].push(point);
+  1431→  1431→
+  1432→  1432→    // Keep max 300 points
+  1433→  1433→    if (this.volumeProxyHistory[underlying].length > 300) {
+  1434→  1434→      this.volumeProxyHistory[underlying].shift();
+  1435→  1435→    }
+  1436→  1436→
+  1437→  1437→    // Check for trap clusters when volume is HIGH or EXTREME
+  1438→  1438→    if (volumePercent >= 3.0) {
+  1439→  1439→      const lastSignal = this.lastSignalType[underlying] || 'NEUTRAL';
+  1440→  1440→      const direction: TrapCluster['direction'] =
+  1441→  1441→        lastSignal === 'LONG' ? 'BEARISH_TRAP' :
+  1442→  1442→        lastSignal === 'SHORT' ? 'BULLISH_TRAP' :
+  1443→  1443→        (this.rng() > 0.5 ? 'BULLISH_TRAP' : 'BEARISH_TRAP');
+  1444→  1444→
+  1445→  1445→      const painIndex = direction === 'BULLISH_TRAP'
+  1446→  1446→        ? atm + Math.floor(this.rng() * 4) * step
+  1447→  1447→        : atm - Math.floor(this.rng() * 4) * step;
+  1448→  1448→
+  1449→  1449→      const cluster: TrapCluster = {
+  1450→  1450→        id: `trap_${underlying}_${Date.now()}`,
+  1451→  1451→        price_high: atm + step,
+  1452→  1452→        price_low: atm - step,
+  1453→  1453→        timestamp_start: Date.now(),
+  1454→  1454→        volume_trapped: Math.floor(volumePercent * 100_000),
+  1455→  1455→        direction,
+  1456→  1456→        pain_index: painIndex,
+  1457→  1457→        active: true,
+  1458→  1458→        triggered: false,
+  1459→  1459→      };
+  1460→  1460→
+  1461→  1461→      if (!this.trapClustersData[underlying]) this.trapClustersData[underlying] = [];
+  1462→  1462→      this.trapClustersData[underlying].push(cluster);
+  1463→  1463→
+  1464→  1464→      // Mark older clusters as triggered/inactive
+  1465→  1465→      const clusters = this.trapClustersData[underlying];
+  1466→  1466→      for (let i = 0; i < clusters.length - 1; i++) {
+  1467→  1467→        if (Date.now() - clusters[i].timestamp_start > 600_000) { // 10 minutes
+  1468→  1468→          clusters[i].active = false;
+  1469→  1469→          clusters[i].triggered = true;
+  1470→  1470→        }
+  1471→  1471→      }
+  1472→  1472→
+  1473→  1473→      // Keep max 50 clusters
+  1474→  1474→      if (clusters.length > 50) {
+  1475→  1475→        clusters.shift();
+  1476→  1476→      }
+  1477→  1477→    }
+  1478→  1478→  }
+  1479→  1479→
+  1480→  1480→  // ============ 7-Strike History Public API ============
+  1481→  1481→
+  1482→  1482→  get7StrikeHistory(underlying: string, expiry: string): SevenStrikeHistory {
+  1483→  1483→    // Generate fresh current data point and add to history
+  1484→  1484→    this.updateCOIPCRHistory(underlying);
+  1485→  1485→    this.updateVolumeProxy(underlying);
+  1486→  1486→
+  1487→  1487→    return {
+  1488→  1488→      underlying,
+  1489→  1489→      expiry,
+  1490→  1490→      coi_pcr_series: this.coiPcrHistory[underlying] || [],
+  1491→  1491→      volume_proxy_series: this.volumeProxyHistory[underlying] || [],
+  1492→  1492→      trap_clusters: (this.trapClustersData[underlying] || []).filter(c => c.active),
+  1493→  1493→      signals: this.signalHistory[underlying] || [],
+  1494→  1494→      trade_suggestions: this.tradeSuggestions[underlying] || [],
+  1495→  1495→    };
+  1496→  1496→  }
+  1497→  1497→
+  1498→  1498→  // ============ 7-Strike Trade Suggestions ============
+  1499→  1499→
+  1500→  1500→  get7StrikeTradeSuggestions(underlying: string, expiry: string): TradeSuggestion[] {
+  1501→  1501→    const signals = this.get7StrikeSignals(underlying, expiry);
+  1502→  1502→    const currentSignal = signals.current_signal;
+  1503→  1503→
+  1504→  1504→    if (!currentSignal || currentSignal.confidence <= 0.6) {
+  1505→  1505→      return this.tradeSuggestions[underlying] || [];
+  1506→  1506→    }
+  1507→  1507→
+  1508→  1508→    const config = UNDERLYING_CONFIG[underlying];
+  1509→  1509→    if (!config) return this.tradeSuggestions[underlying] || [];
+  1510→  1510→
+  1511→  1511→    const lotSize = underlying === 'BANKNIFTY' ? 15 : 25;
+  1512→  1512→    const step = config.strikeStep;
+  1513→  1513→    const spot = this.getSpotPrice(underlying);
+  1514→  1514→    const atm = Math.round(spot / step) * step;
+  1515→  1515→    const T = this.timeToExpiry(expiry || formatExpiryDate(nextThursdays(1)[0]));
+  1516→  1516→    const iv = config.volatility;
+  1517→  1517→
+  1518→  1518→    // Only generate new suggestion if signal type changed or last is old
+  1519→  1519→    const existingSuggestions = this.tradeSuggestions[underlying] || [];
+  1520→  1520→    const lastSuggestion = existingSuggestions.length > 0 ? existingSuggestions[existingSuggestions.length - 1] : null;
+  1521→  1521→    const now = Date.now();
+  1522→  1522→
+  1523→  1523→    if (lastSuggestion && lastSuggestion.signal_type === currentSignal.signal_type && now - lastSuggestion.timestamp < 60_000) {
+  1524→  1524→      // Return existing suggestions — don't spam
+  1525→  1525→      return existingSuggestions;
+  1526→  1526→    }
+  1527→  1527→
+  1528→  1528→    const signalType = currentSignal.signal_type as 'LONG' | 'SHORT';
+  1529→  1529→
+  1530→  1530→    // Option buying: SL below entry, target above entry
+  1531→  1531→    // Higher confidence → tighter SL, larger target
+  1532→  1532→    const slPct = currentSignal.confidence > 0.8 ? 0.30 : 0.40; // 30-40% risk
+  1533→  1533→    const targetPct = currentSignal.confidence > 0.8 ? 1.50 : 1.00; // 100-150% reward
+  1534→  1534→
+  1535→  1535→    let entry_price: number, stop_loss: number, target: number, option_suggestion: string;
+  1536→  1536→
+  1537→  1537→    if (signalType === 'LONG') {
+  1538→  1538→      const ceGreeks = this.bsPrice(spot, atm, T, iv, 'CE');
+  1539→  1539→      entry_price = Math.round(ceGreeks.price * 100) / 100;
+  1540→  1540→      stop_loss = Math.max(0.05, Math.round(entry_price * (1 - slPct) * 100) / 100);
+  1541→  1541→      target = Math.round(entry_price * (1 + targetPct) * 100) / 100;
+  1542→  1542→      option_suggestion = `BUY ${underlying} ${atm} CE (Lot: ${lotSize}, Premium: ₹${entry_price})`;
+  1543→  1543→    } else {
+  1544→  1544→      const peGreeks = this.bsPrice(spot, atm, T, iv, 'PE');
+  1545→  1545→      entry_price = Math.round(peGreeks.price * 100) / 100;
+  1546→  1546→      stop_loss = Math.max(0.05, Math.round(entry_price * (1 - slPct) * 100) / 100);
+  1547→  1547→      target = Math.round(entry_price * (1 + targetPct) * 100) / 100;
+  1548→  1548→      option_suggestion = `BUY ${underlying} ${atm} PE (Lot: ${lotSize}, Premium: ₹${entry_price})`;
+  1549→  1549→    }
+  1550→  1550→
+  1551→  1551→    const risk = entry_price - stop_loss;
+  1552→  1552→    const reward = target - entry_price;
+  1553→  1553→    const rrRatio = risk > 0 ? (reward / risk).toFixed(1) : '0.0';
+  1554→  1554→
+  1555→  1555→    const suggestion: TradeSuggestion = {
+  1556→  1556→      id: `trade_${underlying}_${now}`,
+  1557→  1557→      signal_type: signalType,
+  1558→  1558→      entry_price,
+  1559→  1559→      stop_loss,
+  1560→  1560→      target,
+  1561→  1561→      risk_reward: `1:${rrRatio}`,
+  1562→  1562→      confidence: currentSignal.confidence,
+  1563→  1563→      reason: currentSignal.reason,
+  1564→  1564→      timestamp: now,
+  1565→  1565→      spot_price: Math.round(spot * 100) / 100,
+  1566→  1566→      coi_pcr: currentSignal.coi_pcr,
+  1567→  1567→      status: 'ACTIVE',
+  1568→  1568→      option_suggestion,
+  1569→  1569→      exit_reason: null,
+  1570→  1570→    };
+  1571→  1571→
+  1572→  1572→    if (!this.tradeSuggestions[underlying]) this.tradeSuggestions[underlying] = [];
+  1573→  1573→    this.tradeSuggestions[underlying].push(suggestion);
+  1574→  1574→
+  1575→  1575→    // Keep max 50 suggestions
+  1576→  1576→    if (this.tradeSuggestions[underlying].length > 50) {
+  1577→  1577→      this.tradeSuggestions[underlying].shift();
+  1578→  1578→    }
+  1579→  1579→
+  1580→  1580→    return this.tradeSuggestions[underlying];
+  1581→  1581→  }
+  1582→  1582→
+  1583→  1583→  private timeToExpiry(expiry: string): number {
+  1584→  1584→    try {
+  1585→  1585→      const expiryDate = new Date(expiry + 'T15:30:00+05:30');
+  1586→  1586→      const now = new Date();
+  1587→  1587→      const diffMs = expiryDate.getTime() - now.getTime();
+  1588→  1588→      const diffDays = diffMs / (1000 * 60 * 60 * 24);
+  1589→  1589→      return Math.max(diffDays / 365, 0.001); // in years, min 1 day
+  1590→  1590→    } catch {
+  1591→  1591→      return 7 / 365; // default ~1 week
+  1592→  1592→    }
+  1593→  1593→  }
+  1594→  1594→}
+  1595→  1595→
+  1596→  1596→// ============ Singleton Export ============
+  1597→  1597→
+  1598→  1598→let instance: MarketSimulator | null = null;
+  1599→  1599→
+  1600→  1600→export function getSimulator(): MarketSimulator {
+  1601→  1601→  if (!instance) {
+  1602→  1602→    instance = new MarketSimulator();
+  1603→  1603→  }
+  1604→  1604→  return instance;
+  1605→  1605→}
+  1606→  1606→
