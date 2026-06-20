@@ -7,9 +7,7 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
-  turbopack: {
-    root: "/home/z/my-project",
-  },
+  // turbopack disabled — root path was invalid and caused build panics
   allowedDevOrigins: ["21.0.2.210", ".space-z.ai", "localhost"],
 };
 
