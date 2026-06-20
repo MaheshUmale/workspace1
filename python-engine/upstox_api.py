@@ -9,6 +9,7 @@ import time
 import json
 import asyncio
 from functools import partial
+from collections import OrderedDict
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
@@ -24,7 +25,7 @@ def _get_executor():
     global _executor
     if _executor is None:
         from concurrent.futures import ThreadPoolExecutor
-        _executor = ThreadPoolExecutor(max_workers=4)
+        _executor = ThreadPoolExecutor(max_workers=8)
     return _executor
 
 
@@ -44,7 +45,7 @@ class UpstoxClient:
     def __init__(self, access_token: str, api_key: str = ""):
         self.access_token = access_token
         self.api_key = api_key
-        self._cache: Dict[str, tuple] = {}  # key -> (data, timestamp)
+        self._cache: OrderedDict[str, tuple] = OrderedDict()  # key -> (data, timestamp)
         self.cache_ttl = 5  # seconds
         self._setup_sdk()
 
@@ -65,23 +66,33 @@ class UpstoxClient:
 
     def _cache_key(self, method: str, path: str, **kwargs) -> str:
         """Generate a deterministic cache key from method, path, and params."""
-        return f"{method}:{path}:{json.dumps(kwargs, sort_keys=True)}"
+        # Fast path for common cases without json.dumps overhead
+        if not kwargs:
+            return f"{method}:{path}"
+        # Use str for simple kwargs to avoid json.dumps
+        parts = [f"{k}={v}" for k, v in sorted(kwargs.items())]
+        return f"{method}:{path}:{'&'.join(parts)}"
 
     def _get_cached(self, key: str) -> Optional[Any]:
         """Return cached data if within TTL, else None."""
         if key in self._cache:
             data, ts = self._cache[key]
             if time.time() - ts < self.cache_ttl:
+                # Move to end (most recently used)
+                self._cache.move_to_end(key)
                 return data
+            del self._cache[key]
         return None
 
     def _set_cached(self, key: str, data: Any):
         """Store data in cache with current timestamp."""
-        self._cache[key] = (data, time.time())
-        # Evict oldest entry if cache exceeds 100 items
-        if len(self._cache) > 100:
-            oldest_key = min(self._cache.items(), key=lambda x: x[1][1])[0]
-            del self._cache[oldest_key]
+        now = time.time()
+        if key in self._cache:
+            del self._cache[key]
+        self._cache[key] = (data, now)
+        # Evict oldest entry if cache exceeds 200 items (LRU)
+        if len(self._cache) > 200:
+            self._cache.popitem(last=False)
 
     # ============ Token Helpers ============
 

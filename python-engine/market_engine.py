@@ -125,13 +125,12 @@ class MarketEngine:
 
     async def _update_live_data(self):
         """Fetch live data from Upstox and process it."""
+        now_ms = int(time.time() * 1000)
         for symbol in ["NIFTY", "BANKNIFTY"]:
             try:
-                # Get the latest expiry for this symbol
                 config = UNDERLYING_CONFIG.get(symbol, {})
                 step = config.get("strike_step", 50)
 
-                # Fetch live option chain
                 result = await self.upstox.get_option_chain(symbol, "")
                 if not result.get("success") or not result.get("data"):
                     continue
@@ -144,22 +143,21 @@ class MarketEngine:
                     continue
 
                 atm = round(spot_price / step) * step
-
-                # Transform to our internal format and cache
                 chain = self._transform_upstox_chain(upstox_data, symbol, step)
+
+                # Atomic cache update
                 self._live_chain_cache[symbol] = {
                     "spot_price": spot_price,
                     "atm_strike": atm,
                     "strike_step": step,
                     "chain": chain,
-                    "timestamp": int(time.time() * 1000),
+                    "timestamp": now_ms,
                 }
 
-                # Compute 7-strike matrix from live data
                 matrix = self._compute_7strike_matrix_live(symbol, "", spot_price, atm, step, chain)
                 if matrix:
                     self._db.store_coi_pcr_point(symbol, {
-                        "timestamp": int(time.time() * 1000),
+                        "timestamp": now_ms,
                         "coi_pcr": matrix["coi_pcr"],
                         "spot": matrix["spot_price"],
                         "ce_coi_sum": matrix["ce_coi_sum"],
@@ -169,15 +167,12 @@ class MarketEngine:
                         "confidence": 0,
                     })
 
-                    # Compute signals
                     signals = self._compute_signals_live(symbol, "", matrix)
                     if signals and signals.get("current_signal"):
                         cs = signals["current_signal"]
                         self._db.store_signal(symbol, cs)
-
-                        # Update the last COI PCR point with signal info
                         self._db.store_coi_pcr_point(symbol, {
-                            "timestamp": int(time.time() * 1000),
+                            "timestamp": now_ms,
                             "coi_pcr": matrix["coi_pcr"],
                             "spot": matrix["spot_price"],
                             "ce_coi_sum": matrix["ce_coi_sum"],
@@ -187,23 +182,27 @@ class MarketEngine:
                             "confidence": cs["confidence"],
                         })
 
-                # Store option chain snapshot for replay
-                self._db.store_option_chain_snapshot(
-                    symbol, "", spot_price, atm,
-                    json.dumps([{
+                # Pre-compute snapshot data to avoid repeated dict lookups
+                snapshot_rows = []
+                total_ce_oi = 0
+                total_pe_oi = 0
+                for r in chain:
+                    ce = r["ce"]
+                    pe = r["pe"]
+                    total_ce_oi += ce["oi"]
+                    total_pe_oi += pe["oi"]
+                    snapshot_rows.append({
                         "strike": r["strike"],
-                        "ce_oi": r["ce"]["oi"], "ce_change_oi": r["ce"]["change_oi"],
-                        "pe_oi": r["pe"]["oi"], "pe_change_oi": r["pe"]["change_oi"],
-                        "ce_ltp": r["ce"]["ltp"], "pe_ltp": r["pe"]["ltp"],
-                    } for r in chain])
-                )
+                        "ce_oi": ce["oi"], "ce_change_oi": ce["change_oi"],
+                        "pe_oi": pe["oi"], "pe_change_oi": pe["change_oi"],
+                        "ce_ltp": ce["ltp"], "pe_ltp": pe["ltp"],
+                    })
 
-                # Compute and store PCR
-                total_ce_oi = sum(r["ce"]["oi"] for r in chain)
-                total_pe_oi = sum(r["pe"]["oi"] for r in chain)
+                self._db.store_option_chain_snapshot(symbol, "", spot_price, atm, json.dumps(snapshot_rows))
+
                 pcr_val = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 1.0
                 self._db.store_pcr_point(symbol, {
-                    "timestamp": int(time.time() * 1000),
+                    "timestamp": now_ms,
                     "spot": spot_price,
                     "pcr": round(pcr_val, 4),
                     "change_pcr": 0,
@@ -409,17 +408,10 @@ class MarketEngine:
         return []
 
     def get_candles(self, instrument_key: str, timeframe: str) -> list:
-        """Synchronous candle fetch — live cache → DB → empty."""
-        # 1. In live mode, check DB (populated by periodic updates)
-        if self.mode == "live":
-            db_candles = self._db.get_candles(instrument_key, timeframe)
-            if db_candles:
-                return db_candles
-        # 2. Try DB data regardless
+        """Synchronous candle fetch — DB → empty."""
         db_candles = self._db.get_candles(instrument_key, timeframe)
         if db_candles:
             return db_candles
-        # 3. No data
         return []
 
     async def get_option_chain_async(self, underlying: str, expiry: str) -> dict:

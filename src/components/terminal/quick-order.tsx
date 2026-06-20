@@ -51,7 +51,7 @@ export function QuickOrder() {
     setPlacing(false);
   }, [instrumentKey, orderState, ltp, addRecentOrder]);
 
-  const { recentOrders } = useTradingStore();
+  const recentOrders = useTradingStore((s) => s.recentOrders);
 
   const isBuy = orderState.side === 'BUY';
   const sideColor = isBuy ? 'green' : 'red';

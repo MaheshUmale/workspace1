@@ -40,35 +40,50 @@ export interface DataProviderHealth {
 const PYTHON_ENGINE_PORT = 3035;
 const PYTHON_ENGINE_BASE = `http://localhost:${PYTHON_ENGINE_PORT}`;
 
+// Request deduplication map: key -> Promise
+const _pendingRequests = new Map<string, Promise<any>>();
+
 async function fetchFromPython(path: string, params: Record<string, string> = {}): Promise<any> {
   const url = new URL(path, PYTHON_ENGINE_BASE);
   Object.entries(params).forEach(([k, v]) => {
     if (v !== undefined && v !== '') url.searchParams.set(k, v);
   });
+  const urlStr = url.toString();
+
+  // Deduplicate in-flight requests
+  if (_pendingRequests.has(urlStr)) {
+    return _pendingRequests.get(urlStr)!;
+  }
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
 
-  try {
-    const res = await fetch(url.toString(), {
-      signal: controller.signal,
-      headers: { 'Accept': 'application/json' },
-    });
-    if (!res.ok) {
-      console.warn(`[DataProvider] Python engine returned ${res.status} for ${path}`);
+  const promise = (async () => {
+    try {
+      const res = await fetch(urlStr, {
+        signal: controller.signal,
+        headers: { 'Accept': 'application/json' },
+      });
+      if (!res.ok) {
+        console.warn(`[DataProvider] Python engine returned ${res.status} for ${path}`);
+        return null;
+      }
+      return await res.json();
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        console.warn(`[DataProvider] Python engine timeout for ${path}`);
+      } else {
+        console.warn(`[DataProvider] Python engine error for ${path}:`, err.message);
+      }
       return null;
+    } finally {
+      clearTimeout(timeout);
+      _pendingRequests.delete(urlStr);
     }
-    return await res.json();
-  } catch (err: any) {
-    if (err.name === 'AbortError') {
-      console.warn(`[DataProvider] Python engine timeout for ${path}`);
-    } else {
-      console.warn(`[DataProvider] Python engine error for ${path}:`, err.message);
-    }
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
+  })();
+
+  _pendingRequests.set(urlStr, promise);
+  return promise;
 }
 
 // ============ Empty Data Helpers ============
@@ -107,20 +122,29 @@ class DataProvider {
   private tick_count = 0;
   private _engineHealthy = false;
   private _lastHealthCheck = 0;
+  private _healthCheckPromise: Promise<boolean> | null = null;
 
   constructor() {
-    // Check Python engine health on startup
     this.checkEngineHealth();
   }
 
   private async checkEngineHealth(): Promise<boolean> {
-    // Throttle health checks to once per 10 seconds
     const now = Date.now();
     if (now - this._lastHealthCheck < 10000 && this._engineHealthy) {
       return this._engineHealthy;
     }
-    this._lastHealthCheck = now;
 
+    // Prevent concurrent health checks
+    if (this._healthCheckPromise) {
+      return this._healthCheckPromise;
+    }
+
+    this._healthCheckPromise = this._doHealthCheck();
+    return this._healthCheckPromise;
+  }
+
+  private async _doHealthCheck(): Promise<boolean> {
+    this._lastHealthCheck = Date.now();
     try {
       const health = await fetchFromPython('/api/health');
       if (health && health.status === 'ok') {
@@ -133,6 +157,8 @@ class DataProvider {
     } catch {
       this._engineHealthy = false;
       return false;
+    } finally {
+      this._healthCheckPromise = null;
     }
   }
 
@@ -176,15 +202,16 @@ class DataProvider {
   }
 
   getUpstoxClient(): null {
-    // No more direct Upstox client — everything goes through Python engine
     return null;
   }
 
   // ============ Data Methods — Proxy to Python Engine ============
 
   async getCandles(instrumentKey: string, timeframe: string): Promise<CandleData[]> {
-    await this.checkEngineHealth();
-    if (!this._engineHealthy) return [];
+    if (!this._engineHealthy) {
+      await this.checkEngineHealth();
+      if (!this._engineHealthy) return [];
+    }
 
     try {
       const data = await fetchFromPython('/api/candles', {
@@ -228,8 +255,10 @@ class DataProvider {
     strike_step: number;
     chain: OptionChainRow[];
   }> {
-    await this.checkEngineHealth();
-    if (!this._engineHealthy) return emptyOptionChain(underlying, expiry);
+    if (!this._engineHealthy) {
+      await this.checkEngineHealth();
+      if (!this._engineHealthy) return emptyOptionChain(underlying, expiry);
+    }
 
     try {
       const data = await fetchFromPython('/api/options/chain', {
@@ -257,8 +286,10 @@ class DataProvider {
     strike_step: number;
     chain: MiniOptionChainRow[];
   }> {
-    await this.checkEngineHealth();
-    if (!this._engineHealthy) return emptyMiniOptionChain(underlying, expiry);
+    if (!this._engineHealthy) {
+      await this.checkEngineHealth();
+      if (!this._engineHealthy) return emptyMiniOptionChain(underlying, expiry);
+    }
 
     try {
       const data = await fetchFromPython('/api/options/chain/mini', {
@@ -284,8 +315,10 @@ class DataProvider {
     spot_price: number;
     data: OIDatum[];
   }> {
-    await this.checkEngineHealth();
-    if (!this._engineHealthy) return emptyOIData(underlying, expiry);
+    if (!this._engineHealthy) {
+      await this.checkEngineHealth();
+      if (!this._engineHealthy) return emptyOIData(underlying, expiry);
+    }
 
     try {
       const data = await fetchFromPython('/api/options/oi', {
@@ -312,8 +345,10 @@ class DataProvider {
     current_pcr: number;
     current_change_pcr: number;
   }> {
-    await this.checkEngineHealth();
-    if (!this._engineHealthy) return emptyPCR(underlying, expiry);
+    if (!this._engineHealthy) {
+      await this.checkEngineHealth();
+      if (!this._engineHealthy) return emptyPCR(underlying, expiry);
+    }
 
     try {
       const data = await fetchFromPython('/api/pcr', {
@@ -334,8 +369,10 @@ class DataProvider {
   }
 
   async getExpiries(underlying: string): Promise<ExpiryInfo[]> {
-    await this.checkEngineHealth();
-    if (!this._engineHealthy) return [];
+    if (!this._engineHealthy) {
+      await this.checkEngineHealth();
+      if (!this._engineHealthy) return [];
+    }
 
     try {
       const data = await fetchFromPython('/api/instruments/expiries', {
@@ -355,13 +392,14 @@ class DataProvider {
   }
 
   async searchInstruments(_query: string): Promise<any[]> {
-    // Search instruments through Python engine
     return [];
   }
 
   async get7StrikeMatrix(underlying: string, expiry: string): Promise<SevenStrikeMatrix> {
-    await this.checkEngineHealth();
-    if (!this._engineHealthy) return {} as SevenStrikeMatrix;
+    if (!this._engineHealthy) {
+      await this.checkEngineHealth();
+      if (!this._engineHealthy) return {} as SevenStrikeMatrix;
+    }
 
     try {
       const data = await fetchFromPython('/api/7strike/matrix', {
@@ -376,8 +414,10 @@ class DataProvider {
   }
 
   async get7StrikeSignals(underlying: string, expiry: string): Promise<SevenStrikeSignals> {
-    await this.checkEngineHealth();
-    if (!this._engineHealthy) return {} as SevenStrikeSignals;
+    if (!this._engineHealthy) {
+      await this.checkEngineHealth();
+      if (!this._engineHealthy) return {} as SevenStrikeSignals;
+    }
 
     try {
       const data = await fetchFromPython('/api/7strike/signals', {
@@ -392,8 +432,10 @@ class DataProvider {
   }
 
   async get7StrikeHistory(underlying: string, expiry: string): Promise<SevenStrikeHistory> {
-    await this.checkEngineHealth();
-    if (!this._engineHealthy) return {} as SevenStrikeHistory;
+    if (!this._engineHealthy) {
+      await this.checkEngineHealth();
+      if (!this._engineHealthy) return {} as SevenStrikeHistory;
+    }
 
     try {
       const data = await fetchFromPython('/api/7strike/history', {
@@ -408,8 +450,10 @@ class DataProvider {
   }
 
   async get7StrikeTradeSuggestions(underlying: string, expiry: string): Promise<TradeSuggestion[]> {
-    await this.checkEngineHealth();
-    if (!this._engineHealthy) return [];
+    if (!this._engineHealthy) {
+      await this.checkEngineHealth();
+      if (!this._engineHealthy) return [];
+    }
 
     try {
       const data = await fetchFromPython('/api/7strike/trades', {

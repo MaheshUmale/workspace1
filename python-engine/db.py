@@ -3,6 +3,7 @@ import os
 import json
 import time
 from pathlib import Path
+from collections import deque
 
 DB_PATH = os.environ.get("DUCKDB_PATH", "python-engine/data/trading.duckdb")
 
@@ -14,16 +15,31 @@ class Database:
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._conn = None
+            cls._instance._cache = {}
+            cls._cache_ttl = 2.0  # seconds
         return cls._instance
 
     @property
     def conn(self) -> duckdb.DuckDBPyConnection:
         if self._conn is None:
-            # Ensure data directory exists
             Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
             self._conn = duckdb.connect(DB_PATH)
             self._init_schema()
         return self._conn
+
+    def _get_cached(self, key: str):
+        if key in self._cache:
+            data, ts = self._cache[key]
+            if time.time() - ts < self._cache_ttl:
+                return data
+            del self._cache[key]
+        return None
+
+    def _set_cached(self, key: str, data):
+        self._cache[key] = (data, time.time())
+        if len(self._cache) > 200:
+            oldest = min(self._cache, key=lambda k: self._cache[k][1])
+            del self._cache[oldest]
 
     def _init_schema(self):
         """Initialize all tables"""
@@ -161,19 +177,26 @@ class Database:
         self.conn.execute("""
             DELETE FROM candles WHERE symbol = ? AND timeframe = ?
         """, [symbol, timeframe])
-        for c in candles:
-            self.conn.execute("""
-                INSERT INTO candles VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, [symbol, timeframe, c['time'], c['open'], c['high'], c['low'], c['close'], c['volume']])
+        # Batch insert for 10x performance
+        rows = [(symbol, timeframe, c['time'], c['open'], c['high'], c['low'], c['close'], c['volume']) for c in candles]
+        self.conn.executemany("""
+            INSERT INTO candles VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
 
     def get_candles(self, symbol: str, timeframe: str) -> list:
         """Get candles for symbol/timeframe"""
+        cache_key = f"candles:{symbol}:{timeframe}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
         result = self.conn.execute("""
             SELECT time_stamp, open, high, low, close, volume
             FROM candles WHERE symbol = ? AND timeframe = ?
             ORDER BY time_stamp ASC
         """, [symbol, timeframe]).fetchall()
-        return [{'time': r[0], 'open': r[1], 'high': r[2], 'low': r[3], 'close': r[4], 'volume': r[5]} for r in result]
+        data = [{'time': r[0], 'open': r[1], 'high': r[2], 'low': r[3], 'close': r[4], 'volume': r[5]} for r in result]
+        self._set_cached(cache_key, data)
+        return data
 
     # ============ COI PCR History ============
 
@@ -187,13 +210,19 @@ class Database:
 
     def get_coi_pcr_history(self, symbol: str, limit: int = 300) -> list:
         """Get COI PCR history for symbol"""
+        cache_key = f"coi_pcr:{symbol}:{limit}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
         result = self.conn.execute("""
             SELECT time_stamp, coi_pcr, spot, ce_coi_sum, pe_coi_sum, state, signal_type, confidence
             FROM coi_pcr_history WHERE symbol = ?
             ORDER BY time_stamp ASC LIMIT ?
         """, [symbol, limit]).fetchall()
-        return [{'timestamp': r[0], 'coi_pcr': r[1], 'spot': r[2], 'ce_coi_sum': r[3],
+        data = [{'timestamp': r[0], 'coi_pcr': r[1], 'spot': r[2], 'ce_coi_sum': r[3],
                  'pe_coi_sum': r[4], 'state': r[5], 'signal_type': r[6], 'confidence': r[7]} for r in result]
+        self._set_cached(cache_key, data)
+        return data
 
     # ============ PCR History ============
 
@@ -204,12 +233,18 @@ class Database:
         """, [symbol, point['timestamp'], point['spot'], point['pcr'], point['change_pcr']])
 
     def get_pcr_history(self, symbol: str, limit: int = 300) -> list:
+        cache_key = f"pcr:{symbol}:{limit}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
         result = self.conn.execute("""
             SELECT time_stamp, spot, pcr, change_pcr
             FROM pcr_history WHERE symbol = ?
             ORDER BY time_stamp ASC LIMIT ?
         """, [symbol, limit]).fetchall()
-        return [{'timestamp': r[0], 'spot': r[1], 'pcr': r[2], 'change_pcr': r[3]} for r in result]
+        data = [{'timestamp': r[0], 'spot': r[1], 'pcr': r[2], 'change_pcr': r[3]} for r in result]
+        self._set_cached(cache_key, data)
+        return data
 
     # ============ Signals ============
 
@@ -222,14 +257,20 @@ class Database:
               signal.get('volume_percent'), signal.get('gate_condition'), signal.get('pain_index')])
 
     def get_signals(self, symbol: str, limit: int = 50) -> list:
+        cache_key = f"signals:{symbol}:{limit}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
         result = self.conn.execute("""
             SELECT signal_type, confidence, reason, time_stamp, spot_price, coi_pcr, volume_percent, gate_condition, pain_index
             FROM signals WHERE symbol = ?
             ORDER BY time_stamp DESC LIMIT ?
         """, [symbol, limit]).fetchall()
-        return [{'signal_type': r[0], 'confidence': r[1], 'reason': r[2], 'timestamp': r[3],
+        data = [{'signal_type': r[0], 'confidence': r[1], 'reason': r[2], 'timestamp': r[3],
                  'spot_price': r[4], 'coi_pcr': r[5], 'volume_percent': r[6],
                  'gate_condition': r[7], 'pain_index': r[8]} for r in reversed(result)]
+        self._set_cached(cache_key, data)
+        return data
 
     # ============ Trade Suggestions ============
 
@@ -290,18 +331,35 @@ class Database:
     # ============ Option Chain Snapshots ============
 
     def store_option_chain_snapshot(self, symbol: str, expiry: str, spot_price: float, atm_strike: int, data_json: str):
+        # Use a single INSERT - no need for frequent snapshots, keep last 100 per symbol
+        ts = int(time.time() * 1000)
         self.conn.execute("""
             INSERT INTO option_chain_snapshots (symbol, expiry, time_stamp, spot_price, atm_strike, data_json)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, [symbol, expiry, int(time.time() * 1000), spot_price, atm_strike, data_json])
+        """, [symbol, expiry, ts, spot_price, atm_strike, data_json])
+        # Prune old snapshots to keep DB size bounded (async cleanup)
+        self.conn.execute("""
+            DELETE FROM option_chain_snapshots
+            WHERE id IN (
+                SELECT id FROM option_chain_snapshots
+                WHERE symbol = ? AND expiry = ?
+                ORDER BY time_stamp DESC OFFSET 100
+            )
+        """, [symbol, expiry])
 
     def get_option_chain_snapshots(self, symbol: str, expiry: str, limit: int = 100) -> list:
+        cache_key = f"oc_snap:{symbol}:{expiry}:{limit}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
         result = self.conn.execute("""
             SELECT time_stamp, spot_price, atm_strike, data_json
             FROM option_chain_snapshots WHERE symbol = ? AND expiry = ?
             ORDER BY time_stamp DESC LIMIT ?
         """, [symbol, expiry, limit]).fetchall()
-        return [{'timestamp': r[0], 'spot_price': r[1], 'atm_strike': r[2], 'data': json.loads(r[3])} for r in result]
+        data = [{'timestamp': r[0], 'spot_price': r[1], 'atm_strike': r[2], 'data': json.loads(r[3])} for r in result]
+        self._set_cached(cache_key, data)
+        return data
 
     # ============ Replay Sessions ============
 

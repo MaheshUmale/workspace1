@@ -68,25 +68,58 @@ interface ExpiryResponse {
   }>;
 }
 
+// ============ Shared Cache (Module-level, survives re-renders) ============
+
+const _candlesCache: Record<string, { data: CandleData[]; timestamp: number }> = {};
+const _optionChainCache: Record<string, { data: any; timestamp: number }> = {};
+const _pcrCache: Record<string, { data: any; timestamp: number }> = {};
+const _expiriesCache: Record<string, { data: string[]; timestamp: number }> = {};
+
+// TTL constants
+const CANDLE_TTL_1M = 30000;
+const CANDLE_TTL_OTHER = 120000;
+const OPTION_CHAIN_TTL = 10000;
+const PCR_TTL = 15000;
+const EXPIRIES_TTL = 300000;
+
+function getCandleTTL(tf: Timeframe) {
+  return tf === '1m' ? CANDLE_TTL_1M : CANDLE_TTL_OTHER;
+}
+
+function cacheKey(...parts: string[]) {
+  return parts.join(':');
+}
+
+// ============ Hook ============
+
 export function useMarketData() {
-  const {
-    underlying,
-    expiry,
-    timeframe,
-    setOptionChain,
-    setAtmStrike,
-    setExpiries,
-    setExpiry,
-    addPCRDataPoint,
-    setCurrentPCR,
-    updateSpotData,
-  } = useTradingStore();
+  // Use selector-based subscriptions to avoid re-renders from unrelated state changes
+  const underlying = useTradingStore((s) => s.underlying);
+  const expiry = useTradingStore((s) => s.expiry);
+  const timeframe = useTradingStore((s) => s.timeframe);
 
-  const candlesCacheRef = useRef<Record<string, { data: CandleData[]; timestamp: number }>>({});
+  // Get actions via getState to avoid subscription re-renders
+  const storeActions = useRef({
+    setOptionChain: useTradingStore.getState().setOptionChain,
+    setAtmStrike: useTradingStore.getState().setAtmStrike,
+    setExpiries: useTradingStore.getState().setExpiries,
+    setExpiry: useTradingStore.getState().setExpiry,
+    addPCRDataPoint: useTradingStore.getState().addPCRDataPoint,
+    setCurrentPCR: useTradingStore.getState().setCurrentPCR,
+    updateSpotData: useTradingStore.getState().updateSpotData,
+  });
 
-  // Cache TTL: 30 seconds for 1m candles, 2 minutes for higher timeframes
-  const getCacheTTL = useCallback((tf: Timeframe) => {
-    return tf === '1m' ? 30000 : 120000;
+  // Keep actions ref fresh
+  useEffect(() => {
+    storeActions.current = {
+      setOptionChain: useTradingStore.getState().setOptionChain,
+      setAtmStrike: useTradingStore.getState().setAtmStrike,
+      setExpiries: useTradingStore.getState().setExpiries,
+      setExpiry: useTradingStore.getState().setExpiry,
+      addPCRDataPoint: useTradingStore.getState().addPCRDataPoint,
+      setCurrentPCR: useTradingStore.getState().setCurrentPCR,
+      updateSpotData: useTradingStore.getState().updateSpotData,
+    };
   }, []);
 
   // Fetch candles
@@ -94,11 +127,10 @@ export function useMarketData() {
     instrumentKey: string,
     tf: Timeframe
   ): Promise<CandleData[]> => {
-    const cacheKey = `${instrumentKey}_${tf}`;
-    const cached = candlesCacheRef.current[cacheKey];
-    const ttl = getCacheTTL(tf);
+    const key = cacheKey(instrumentKey, tf);
+    const cached = _candlesCache[key];
+    const ttl = getCandleTTL(tf);
 
-    // Return cached data if still fresh
     if (cached && (Date.now() - cached.timestamp) < ttl) {
       return cached.data;
     }
@@ -110,18 +142,15 @@ export function useMarketData() {
       });
       const candles = data.candles || [];
 
-      // Bug 2 fix: Only cache if we got data
       if (candles.length > 0) {
-        candlesCacheRef.current[cacheKey] = { data: candles, timestamp: Date.now() };
+        _candlesCache[key] = { data: candles, timestamp: Date.now() };
 
-        // Bug 2 fix: Update spot data from last candle if no spot data exists
-        // This ensures we always have a spot price even when option chain is empty
         const isIndex = instrumentKey === 'NIFTY' || instrumentKey === 'BANKNIFTY';
         const currentSpot = useTradingStore.getState().spotData[instrumentKey];
         if (isIndex && (!currentSpot || currentSpot.ltp === 0)) {
           const lastCandle = candles[candles.length - 1];
           if (lastCandle && lastCandle.close > 0) {
-            updateSpotData({
+            storeActions.current.updateSpotData({
               symbol: instrumentKey,
               ltp: lastCandle.close,
               change: lastCandle.close - lastCandle.open,
@@ -140,11 +169,10 @@ export function useMarketData() {
       return candles;
     } catch (err) {
       console.error('[MarketData] Failed to fetch candles:', err);
-      // Return stale cache if available
       if (cached) return cached.data;
       return [];
     }
-  }, [getCacheTTL, updateSpotData]);
+  }, []);
 
   // Fetch option chain
   const fetchOptionChain = useCallback(async (
@@ -152,6 +180,15 @@ export function useMarketData() {
     exp: string
   ) => {
     if (!exp) return;
+
+    const key = cacheKey(symbol, exp);
+    const cached = _optionChainCache[key];
+    if (cached && (Date.now() - cached.timestamp) < OPTION_CHAIN_TTL) {
+      // Still update store from cache to keep UI fresh
+      storeActions.current.setOptionChain(cached.data.rows);
+      storeActions.current.setAtmStrike(cached.data.atm_strike);
+      return;
+    }
 
     try {
       const data = await fetchAPI<OptionChainResponse>('/api/option-chain/mini', {
@@ -172,12 +209,16 @@ export function useMarketData() {
         pe_instrument_key: row.pe?.instrument_key ?? '',
       }));
 
-      setOptionChain(rows);
-      setAtmStrike(data.atm_strike);
+      storeActions.current.setOptionChain(rows);
+      storeActions.current.setAtmStrike(data.atm_strike);
 
-      // Bug 2 fix: Also update spot data from option chain response
+      _optionChainCache[key] = {
+        data: { rows, atm_strike: data.atm_strike },
+        timestamp: Date.now(),
+      };
+
       if (data.spot_price > 0) {
-        updateSpotData({
+        storeActions.current.updateSpotData({
           symbol,
           ltp: data.spot_price,
           change: 0,
@@ -193,7 +234,7 @@ export function useMarketData() {
     } catch (err) {
       console.error('[MarketData] Failed to fetch option chain:', err);
     }
-  }, [setOptionChain, setAtmStrike, updateSpotData]);
+  }, []);
 
   // Fetch PCR data
   const fetchPCR = useCallback(async (
@@ -202,53 +243,75 @@ export function useMarketData() {
   ) => {
     if (!exp) return;
 
+    const key = cacheKey(symbol, exp);
+    const cached = _pcrCache[key];
+    if (cached && (Date.now() - cached.timestamp) < PCR_TTL) {
+      storeActions.current.setCurrentPCR(cached.data.current_pcr, cached.data.current_change_pcr);
+      return;
+    }
+
     try {
       const data = await fetchAPI<PCRResponse>('/api/pcr', {
         underlying: symbol,
         expiry: exp,
       });
 
-      // Add all PCR data points
       if (data.data && data.data.length > 0) {
-        for (const point of data.data.slice(-50)) {
-          addPCRDataPoint({
-            timestamp: point.timestamp,
-            spot: point.spot,
-            pcr: point.pcr,
-            change_pcr: point.change_pcr,
-          });
-        }
+        const latest = data.data[data.data.length - 1];
+        storeActions.current.addPCRDataPoint({
+          timestamp: latest.timestamp,
+          spot: latest.spot,
+          pcr: latest.pcr,
+          change_pcr: latest.change_pcr,
+        });
       }
 
-      setCurrentPCR(data.current_pcr, data.current_change_pcr);
+      storeActions.current.setCurrentPCR(data.current_pcr, data.current_change_pcr);
+
+      _pcrCache[key] = {
+        data: { current_pcr: data.current_pcr, current_change_pcr: data.current_change_pcr },
+        timestamp: Date.now(),
+      };
     } catch (err) {
       console.error('[MarketData] Failed to fetch PCR:', err);
     }
-  }, [addPCRDataPoint, setCurrentPCR]);
+  }, []);
 
   // Fetch expiries
   const fetchExpiries = useCallback(async (symbol: string) => {
+    const key = cacheKey(symbol);
+    const cached = _expiriesCache[key];
+    if (cached && (Date.now() - cached.timestamp) < EXPIRIES_TTL) {
+      storeActions.current.setExpiries(cached.data);
+      if (cached.data.length > 0 && !useTradingStore.getState().expiry) {
+        storeActions.current.setExpiry(cached.data[0]);
+      }
+      return;
+    }
+
     try {
       const data = await fetchAPI<ExpiryResponse>('/api/instruments/expiries', {
         underlying: symbol,
       });
 
       const expiries = (data.expiries || []).map((e) => e.expiry_date);
-      setExpiries(expiries);
+      storeActions.current.setExpiries(expiries);
 
-      // Auto-select first expiry if none selected
+      _expiriesCache[key] = { data: expiries, timestamp: Date.now() };
+
       if (expiries.length > 0 && !useTradingStore.getState().expiry) {
-        setExpiry(expiries[0]);
+        storeActions.current.setExpiry(expiries[0]);
       }
     } catch (err) {
       console.error('[MarketData] Failed to fetch expiries:', err);
     }
-  }, [setExpiries, setExpiry]);
+  }, []);
 
-  // Bug 2 fix: Clear candle cache when timeframe changes (not just on mount)
-  // Also clear cache when underlying changes to avoid stale data
+  // Clear caches when timeframe or underlying changes
   useEffect(() => {
-    candlesCacheRef.current = {};
+    Object.keys(_candlesCache).forEach((k) => delete _candlesCache[k]);
+    Object.keys(_optionChainCache).forEach((k) => delete _optionChainCache[k]);
+    Object.keys(_pcrCache).forEach((k) => delete _pcrCache[k]);
   }, [timeframe, underlying]);
 
   // Fetch expiries when underlying changes
@@ -257,7 +320,6 @@ export function useMarketData() {
   }, [underlying, fetchExpiries]);
 
   // Fetch option chain and PCR when underlying/expiry changes
-  // Bug 4 fix: Also refetch on timeframe change to keep OI data fresh
   useEffect(() => {
     if (expiry) {
       fetchOptionChain(underlying, expiry);
@@ -265,7 +327,7 @@ export function useMarketData() {
     }
   }, [underlying, expiry, fetchOptionChain, fetchPCR]);
 
-  // Periodic refresh of option chain (every 15 seconds for live OI data)
+  // Periodic refresh (15s for live OI data)
   useEffect(() => {
     if (!expiry) return;
     const interval = setInterval(() => {
