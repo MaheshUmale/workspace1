@@ -187,7 +187,7 @@ Browser → Next.js (:3000) → Python Engine (:3035) → Upstox Python SDK → 
 │   └── lib/                   #   Utility libraries
 │       ├── data-provider.ts         # Proxy to Python engine
 │       ├── chart-utils.ts           # Chart helpers + fetchAPI
-│       ├── market-simulator.ts      # Type definitions
+│       ├── market-simulator.ts      # Type definitions (Interfaces only)
 │       └── upstox-client.ts         # Legacy (NOT used)
 │
 ├── .env.example                # Environment template

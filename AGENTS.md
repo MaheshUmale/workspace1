@@ -28,7 +28,7 @@ Browser → Next.js (port 3000) → Python Engine (port 3035) → Upstox Python 
 - All market data flows: Browser → Next.js API Route → Python Engine → Upstox SDK
 - The DataProvider (`src/lib/data-provider.ts`) is a thin proxy to the Python engine — it never calls Upstox directly
 - Python engine caches responses (5s default, 30s for instrument search, 300s for instrument cache)
-- NO simulation, NO mock data — if Upstox is offline, return empty data
+- NO simulation, NO mock data — if Upstox is offline, return empty data (Live & Replay only)
 
 ### API Versioning
 - Upstox has a mix of v2 and v3 APIs — the SDK handles both

@@ -203,7 +203,7 @@ User types "NIFTY 23900 CE" → InstrumentSearch (300ms debounce)
   │   ├── Logo
   │   ├── <UnderlyingSelector> — NIFTY / BNF buttons
   │   ├── <InstrumentSearch> — Search box → SDK → select
-  │   ├── <ConnectionStatus> — LIVE/OFFLINE/SIM badge
+  │   ├── <ConnectionStatus> — LIVE/OFFLINE badge
   │   └── <UpstoxConfigDialog> — Token input → POST /api/config/upstox
   │
   ├── <ResizablePanelGroup> (vertical)

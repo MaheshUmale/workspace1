@@ -42,7 +42,7 @@ page.tsx (root layout)
 - NO direct Upstox API calls from TypeScript — everything proxied through Python engine
 - `data-provider.ts` is a thin proxy — it calls `fetchFromPython()` which hits `http://localhost:3035`
 - The old `upstox-client.ts` is NOT used — kept only for type reference
-- `market-simulator.ts` provides TypeScript type definitions only — no simulation logic
+- `market-simulator.ts` provides TypeScript type definitions only — no simulation logic (Interfaces only)
 - Canvas OI overlay on SpotChart uses 100ms periodic redraw loop with `priceToCoordinate()` for Y-axis scaling
 - CE bars (red) extend LEFT, PE bars (green) extend RIGHT from center vertical line
 
