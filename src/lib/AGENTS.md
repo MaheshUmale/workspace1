@@ -8,7 +8,7 @@ Core utility modules: data provider (proxy to Python engine), chart helpers, typ
 
 - `data-provider.ts` — Primary data interface, proxies all calls to Python engine
 - `chart-utils.ts` — Chart rendering utilities and `fetchAPI()` helper
-- `market-simulator.ts` — TypeScript type definitions (no simulation logic)
+- `market-simulator.ts` — TypeScript type definitions (Interfaces only)
 - `upstox-client.ts` — Legacy Upstox client (NOT used — kept for reference)
 - `python-engine-proxy.ts` — Python engine proxy utilities
 - `db.ts` — Prisma database client
@@ -41,7 +41,7 @@ Key methods:
 - Chart-specific utilities for lightweight-charts configuration
 
 ### market-simulator.ts
-- **Type definitions ONLY** — no simulation logic
+- **Type definitions ONLY** — simulation logic removed
 - Defines: `CandleData`, `OptionChainRow`, `MiniOptionChainRow`, `Instrument`, `ExpiryInfo`, `OIDatum`, `PCRPoint`, etc.
 - These types are shared across components and hooks
 

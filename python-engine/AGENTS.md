@@ -23,7 +23,6 @@ FastAPI backend that serves as the sole interface to Upstox APIs. Uses the offic
 | `config.py` | Environment variables, underlying config, timeframe mapping |
 | `db.py` | DuckDB schema and CRUD for candles, option chain snapshots, PCR, signals, trades |
 | `models.py` | Pydantic models for request/response validation |
-| `data_simulator.py` | Legacy — NOT used. NO simulation allowed |
 
 ### SDK Integration Rules
 - SDK package name is `upstox_client` (the installed pip package)
