@@ -1,10 +1,11 @@
 'use client';
 
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback, useState } from 'react';
 import { createChart, type IChartApi, type ISeriesApi, LineStyle } from 'lightweight-charts';
+import { Plus, Minus, Maximize2 } from 'lucide-react';
 import { useTradingStore, type Timeframe } from '@/store/trading-store';
 import { TimeframeSelector } from './timeframe-selector';
-import { DARK_THEME, CANDLE_COLORS, buildInstrumentKey, formatNumber, addCandlestickSeries, addHistogramSeries } from '@/lib/chart-utils';
+import { DARK_THEME, CANDLE_COLORS, buildInstrumentKey, formatNumber, addCandlestickSeries, addHistogramSeries, fetchAPI } from '@/lib/chart-utils';
 import { useMarketData, type CandleData } from '@/hooks/use-market-data';
 
 interface OptionChartProps {
@@ -16,6 +17,8 @@ export function OptionChart({ optionType }: OptionChartProps) {
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
+  const lastKeyRef = useRef<string>('');
+  const [isAutoFit, setIsAutoFit] = useState(true);
 
   const { underlying, expiry, selectedStrike, timeframe, optionChain, spotData, atmStrike } = useTradingStore();
   const spot = spotData[underlying];
@@ -172,8 +175,12 @@ export function OptionChart({ optionType }: OptionChartProps) {
     // Bug 3 fix: REMOVED fake sine wave OI line series data generation.
     // Option charts should ONLY show candlesticks + volume.
 
-    chartRef.current?.timeScale().fitContent();
-  }, [underlying, expiry, currentStrike, optionType, timeframe, fetchCandles, optionChain]);
+    const isNewInstrument = instrumentKey !== lastKeyRef.current;
+    if (isAutoFit || isNewInstrument) {
+      chartRef.current?.timeScale().fitContent();
+      lastKeyRef.current = instrumentKey;
+    }
+  }, [underlying, expiry, currentStrike, optionType, timeframe, fetchCandles, optionChain, isAutoFit]);
 
   useEffect(() => {
     loadData();
@@ -211,7 +218,43 @@ export function OptionChart({ optionType }: OptionChartProps) {
       </div>
 
       {/* Chart */}
-      <div ref={containerRef} className="flex-1 min-h-0" />
+      <div className="flex-1 min-h-0 relative group">
+        <div ref={containerRef} className="w-full h-full" />
+
+        {/* Chart Controls */}
+        <div className="absolute bottom-4 right-4 flex items-center gap-1.5 z-20 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button
+            onClick={() => chartRef.current?.timeScale().zoomIn(0.1)}
+            className="p-1.5 bg-[#1f2937]/80 hover:bg-[#374151] rounded text-gray-400 hover:text-white border border-[#374151] transition-colors"
+            title="Zoom In"
+          >
+            <Plus size={14} />
+          </button>
+          <button
+            onClick={() => chartRef.current?.timeScale().zoomOut(0.1)}
+            className="p-1.5 bg-[#1f2937]/80 hover:bg-[#374151] rounded text-gray-400 hover:text-white border border-[#374151] transition-colors"
+            title="Zoom Out"
+          >
+            <Minus size={14} />
+          </button>
+          <button
+            onClick={() => {
+              setIsAutoFit(!isAutoFit);
+              if (!isAutoFit) {
+                chartRef.current?.timeScale().fitContent();
+              }
+            }}
+            className={`flex items-center gap-1 px-2 py-1.5 rounded text-[10px] font-bold border transition-colors ${
+              isAutoFit
+                ? 'bg-blue-600/80 border-blue-500 text-white'
+                : 'bg-[#1f2937]/80 border-[#374151] text-gray-400 hover:text-white'
+            }`}
+          >
+            <Maximize2 size={12} />
+            AUTO
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

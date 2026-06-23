@@ -1,7 +1,8 @@
 'use client';
 
-import { useEffect, useRef, useCallback, memo } from 'react';
+import { useEffect, useRef, useCallback, memo, useState } from 'react';
 import { createChart, type IChartApi, type ISeriesApi, LineStyle } from 'lightweight-charts';
+import { Plus, Minus, Maximize2 } from 'lucide-react';
 import { useTradingStore, type OIProfile, type OptionChainRow } from '@/store/trading-store';
 import { TimeframeSelector } from './timeframe-selector';
 import { DARK_THEME, CANDLE_COLORS, formatNumber, addCandlestickSeries, addHistogramSeries } from '@/lib/chart-utils';
@@ -206,6 +207,8 @@ export function SpotChart() {
   const rafRef = useRef<number>(0);
   const redrawIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastDrawRef = useRef<string>('');
+  const lastUnderlyingRef = useRef<string>('');
+  const [isAutoFit, setIsAutoFit] = useState(true);
 
   const { underlying, spotData, timeframe, atmStrike, optionChain, oiProfile, setOiProfile } = useTradingStore();
   const spot = spotData[underlying];
@@ -330,14 +333,18 @@ export function SpotChart() {
       }))
     );
 
-    chartRef.current?.timeScale().fitContent();
+    const isNewUnderlying = underlying !== lastUnderlyingRef.current;
+    if (isAutoFit || isNewUnderlying) {
+      chartRef.current?.timeScale().fitContent();
+      lastUnderlyingRef.current = underlying;
+    }
 
     // Single delayed redraw after fitContent
     setTimeout(() => {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = requestAnimationFrame(redrawOI);
     }, 250);
-  }, [underlying, timeframe, fetchCandles, redrawOI]);
+  }, [underlying, timeframe, fetchCandles, redrawOI, isAutoFit]);
 
   useEffect(() => {
     loadCandles();
@@ -420,7 +427,43 @@ export function SpotChart() {
         oiProfile={oiProfile}
         onToggle={setOiProfile}
       />
-      <div ref={containerRef} className="flex-1 min-h-0" />
+      <div className="flex-1 min-h-0 relative group">
+        <div ref={containerRef} className="w-full h-full" />
+
+        {/* Chart Controls */}
+        <div className="absolute bottom-4 right-4 flex items-center gap-1.5 z-20 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button
+            onClick={() => chartRef.current?.timeScale().zoomIn(0.1)}
+            className="p-1.5 bg-[#1f2937]/80 hover:bg-[#374151] rounded text-gray-400 hover:text-white border border-[#374151] transition-colors"
+            title="Zoom In"
+          >
+            <Plus size={14} />
+          </button>
+          <button
+            onClick={() => chartRef.current?.timeScale().zoomOut(0.1)}
+            className="p-1.5 bg-[#1f2937]/80 hover:bg-[#374151] rounded text-gray-400 hover:text-white border border-[#374151] transition-colors"
+            title="Zoom Out"
+          >
+            <Minus size={14} />
+          </button>
+          <button
+            onClick={() => {
+              setIsAutoFit(!isAutoFit);
+              if (!isAutoFit) {
+                chartRef.current?.timeScale().fitContent();
+              }
+            }}
+            className={`flex items-center gap-1 px-2 py-1.5 rounded text-[10px] font-bold border transition-colors ${
+              isAutoFit
+                ? 'bg-blue-600/80 border-blue-500 text-white'
+                : 'bg-[#1f2937]/80 border-[#374151] text-gray-400 hover:text-white'
+            }`}
+          >
+            <Maximize2 size={12} />
+            AUTO
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
