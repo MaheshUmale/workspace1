@@ -31,9 +31,12 @@ const ATM_STROKE_COLOR = 'rgba(234, 179, 8, 0.6)';
 const BAR_HEIGHT = 14;
 
 function drawOIBars({ ctx, series, optionChain, atmStrike, oiProfile, canvasWidth, canvasHeight }: OIDrawParams) {
-  ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+  if (canvasWidth === 0 || canvasHeight === 0) return;
 
-  if (!optionChain.length || canvasWidth === 0 || canvasHeight === 0) return;
+  if (!optionChain || !optionChain.length) {
+    ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+    return;
+  }
 
   const step = atmStrike % 100 === 0 ? 100 : 50;
   const minStrike = atmStrike - step * 15;
@@ -60,7 +63,13 @@ function drawOIBars({ ctx, series, optionChain, atmStrike, oiProfile, canvasWidt
     if (peVal > maxVal) maxVal = peVal;
   }
 
-  if (!visibleValues.length) return;
+  if (!visibleValues.length) {
+    ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+    return;
+  }
+
+  // Only clear if we have something new to draw
+  ctx.clearRect(0, 0, canvasWidth, canvasHeight);
 
   const maxBarPixels = canvasWidth * 0.35;
   const centerX = canvasWidth * 0.55;
@@ -197,6 +206,7 @@ export function SpotChart() {
   const priceLineRef = useRef<any>(null);
   const rafRef = useRef<number>(0);
   const redrawIntervalRef = useRef<any>(null);
+  const dataRef = useRef<{ optionChain: OptionChainRow[]; atmStrike: number; oiProfile: OIProfile }>({ optionChain: [], atmStrike: 0, oiProfile: 'COI' });
   const lastDrawRef = useRef<string>('');
   const lastUnderlyingRef = useRef<string>('');
   const lastTimeframeRef = useRef<string>('');
@@ -205,6 +215,11 @@ export function SpotChart() {
   const { underlying, spotData, timeframe, atmStrike, optionChain, oiProfile, setOiProfile } = useTradingStore();
   const spot = spotData[underlying];
   const { fetchCandles } = useMarketData();
+
+  // Sync data to ref to avoid stale closures in interval
+  useEffect(() => {
+    dataRef.current = { optionChain, atmStrike, oiProfile };
+  }, [optionChain, atmStrike, oiProfile]);
 
   const redrawOI = useCallback(() => {
     if (!chartRef.current || !candleSeriesRef.current || !overlayCanvasRef.current) return;
@@ -227,22 +242,24 @@ export function SpotChart() {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
+    const { optionChain: currentChain, atmStrike: currentAtm, oiProfile: currentProfile } = dataRef.current;
     const logicalRange = chartRef.current.timeScale().getVisibleLogicalRange();
     const rangeHash = logicalRange ? `${logicalRange.from}-${logicalRange.to}` : '';
-    const dataHash = `${optionChain.length}-${atmStrike}-${oiProfile}-${rect.width}-${rect.height}-${rangeHash}`;
+    const dataHash = `${currentChain.length}-${currentAtm}-${currentProfile}-${rect.width}-${rect.height}-${rangeHash}`;
+
     if (dataHash === lastDrawRef.current) return;
     lastDrawRef.current = dataHash;
 
     drawOIBars({
       ctx,
       series: candleSeriesRef.current,
-      optionChain,
-      atmStrike,
-      oiProfile,
+      optionChain: currentChain,
+      atmStrike: currentAtm,
+      oiProfile: currentProfile,
       canvasWidth: rect.width,
       canvasHeight: rect.height,
     });
-  }, [optionChain, atmStrike, oiProfile]);
+  }, []);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -347,7 +364,7 @@ export function SpotChart() {
     lastDrawRef.current = '';
     const raf = requestAnimationFrame(redrawOI);
     return () => cancelAnimationFrame(raf);
-  }, [redrawOI, optionChain, atmStrike, oiProfile]);
+  }, [redrawOI]);
 
   useEffect(() => {
     if (!candleSeriesRef.current || !spot) return;
