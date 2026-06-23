@@ -136,14 +136,14 @@ class UpstoxClient:
         encoded_key = urllib.parse.quote(upstox_key)
         now = datetime.now()
         today_str = now.strftime("%Y-%m-%d")
-        from_date = (now - timedelta(days=4)).strftime("%Y-%m-%d")
+        # Support longer lookback for daily timeframe
+        days_back = 365 if timeframe == "1d" else 4
+        from_date = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
 
         headers = {"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"}
         all_candles = []
 
         async with httpx.AsyncClient() as client:
-            # For V3, it's safer to try both historical and intraday and merge
-            # Historical covers up to previous close, Intraday covers today
             urls = []
             if timeframe != "1d":
                 urls.append(f"https://api.upstox.com/v3/historical-candle/intraday/{encoded_key}/{unit}/{interval}")
@@ -235,6 +235,53 @@ class UpstoxClient:
     # ================================================================
     # Other Market Data (V2 SDK)
     # ================================================================
+
+    async def get_ltp(self, instrument_key: str) -> Dict[str, Any]:
+        """Fetch Last Traded Price for an instrument."""
+        if not HAS_SDK: return {"success": False}
+        return await _run_sync(self._get_ltp_sync, instrument_key)
+
+    def _get_ltp_sync(self, instrument_key: str) -> Dict[str, Any]:
+        upstox_key = instrument_key
+        if instrument_key == "NIFTY": upstox_key = "NSE_INDEX|Nifty 50"
+        elif instrument_key == "BANKNIFTY": upstox_key = "NSE_INDEX|Nifty Bank"
+        try:
+            response = self._market_quote_api.ltp(symbol=upstox_key, api_version='2.0')
+            if response and hasattr(response, 'data') and response.data:
+                key = upstox_key.replace("|", ":")
+                ltp_data = response.data.get(key, {})
+                return {"success": True, "ltp": ltp_data.get("last_price", 0)}
+        except: pass
+        return {"success": False}
+
+    async def get_user_profile(self) -> Dict[str, Any]:
+        """Fetch authenticated user profile from Upstox."""
+        if not HAS_SDK: return {"success": False}
+        return await _run_sync(self._get_user_profile_sync)
+
+    def _get_user_profile_sync(self) -> Dict[str, Any]:
+        try:
+            profile = self._user_api.get_profile(api_version='2.0')
+            if profile and hasattr(profile, 'data'):
+                return {"success": True, "data": profile.data.to_dict() if hasattr(profile.data, 'to_dict') else {}}
+        except: pass
+        return {"success": False}
+
+    async def build_instrument_cache(self, underlyings: List[str] = None):
+        """Pre-build a local cache of instruments for fast search."""
+        if not HAS_SDK: return
+        if underlyings is None: underlyings = ["NIFTY", "BANKNIFTY"]
+        print(f"[UpstoxClient] Building instrument cache for {underlyings}...")
+        for underlying in underlyings:
+            query = "Nifty" if underlying == "NIFTY" else "Nifty Bank" if underlying == "BANKNIFTY" else underlying
+            for period in ["current_month", "next_month"]:
+                try:
+                    res = self._instruments_api.search_instrument(query=query, expiry=period)
+                    if res and res.data:
+                        for item in res.data:
+                            ts = item.get("trading_symbol")
+                            if ts: self._set_cached(self._cache_key("SEARCH", ts.upper()), item)
+                except: continue
 
     async def get_option_chain(self, underlying: str, expiry: str) -> Dict[str, Any]:
         if not HAS_SDK: return {"success": False}
