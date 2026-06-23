@@ -6,7 +6,10 @@ router = APIRouter()
 
 
 @router.get("/search")
-async def search_instruments(q: str = Query("", description="Search query")):
+async def search_instruments(
+    q: str = Query("", description="Search query"),
+    expiry: str = Query(None, description="Optional expiry filter (e.g. current_week, current_month)")
+):
     """Search instruments by human-readable query like 'NIFTY 23900 CE'
 
     Uses the Upstox SDK InstrumentsApi.search_instrument() for live search.
@@ -16,7 +19,7 @@ async def search_instruments(q: str = Query("", description="Search query")):
     if not q or len(q) < 2:
         return {"results": []}
 
-    results = await engine.search_instruments_async(q)
+    results = await engine.search_instruments_async(q, expiry)
     return {"results": results}
 
 

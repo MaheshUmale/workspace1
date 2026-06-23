@@ -275,8 +275,11 @@ class UpstoxClient:
         return {"iv": 0, "delta": 0, "gamma": 0, "theta": 0, "vega": 0}
 
     def _get_candles_sync(self, instrument_key: str, timeframe: str) -> Dict[str, Any]:
-        """Synchronous candle fetch using the SDK."""
+        """Synchronous candle fetch using the SDK.
+        Fetches historical data + today's intraday data and merges them to provide full history.
+        """
         from config import UPSTOX_TIMEFRAME_MAP
+        from datetime import timedelta
 
         upstox_key = instrument_key
         if instrument_key == "NIFTY":
@@ -285,30 +288,78 @@ class UpstoxClient:
             upstox_key = "NSE_INDEX|Nifty Bank"
 
         upstox_tf = UPSTOX_TIMEFRAME_MAP.get(timeframe, "1minute")
+        now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
 
         try:
-            if timeframe == "1d":
-                today = datetime.now().strftime("%Y-%m-%d")
-                from datetime import timedelta
-                from_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
-                response = self._history_api.get_historical_candle_data1(
+            all_candles = []
+
+            # 1. Fetch historical data (last 4 days for intraday to ensure last trading day/weekends are included)
+            days_back = 365 if timeframe == "1d" else 4
+            from_date = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
+
+            try:
+                hist_response = self._history_api.get_historical_candle_data1(
                     instrument_key=upstox_key,
                     interval=upstox_tf,
-                    to_date=today,
+                    to_date=today_str,
                     from_date=from_date,
                     api_version='2.0'
                 )
-            else:
-                response = self._history_api.get_intra_day_candle_data(
-                    instrument_key=upstox_key,
-                    interval=upstox_tf,
-                    api_version='2.0'
-                )
+                if hist_response and hasattr(hist_response, 'data') and hist_response.data:
+                    all_candles.extend(hist_response.data.candles if hasattr(hist_response.data, 'candles') else [])
+            except Exception as e:
+                print(f"[UpstoxClient] Hist candle error for {instrument_key}: {e}")
 
-            if response and hasattr(response, 'data') and response.data:
-                candles_raw = response.data.candles if hasattr(response.data, 'candles') else []
-                if candles_raw:
-                    return {"success": True, "data": candles_raw}
+            # 2. Fetch today's intraday data (more real-time)
+            if timeframe != "1d":
+                try:
+                    intra_response = self._history_api.get_intra_day_candle_data(
+                        instrument_key=upstox_key,
+                        interval=upstox_tf,
+                        api_version='2.0'
+                    )
+                    if intra_response and hasattr(intra_response, 'data') and intra_response.data:
+                        intra_candles = intra_response.data.candles if hasattr(intra_response.data, 'candles') else []
+                        all_candles.extend(intra_candles)
+                except Exception as e:
+                    print(f"[UpstoxClient] Intra candle error for {instrument_key}: {e}")
+
+            if all_candles:
+                # Robust processing: normalize timestamps to seconds and deduplicate
+                processed = []
+                for c in all_candles:
+                    try:
+                        ts_val = c[0]
+                        if isinstance(ts_val, str):
+                            # Handle ISO format "2024-06-27T09:15:00+05:30"
+                            dt = datetime.fromisoformat(ts_val.replace('Z', '+00:00'))
+                            ts = int(dt.timestamp())
+                        else:
+                            # Handle ms vs s
+                            ts = int(ts_val / 1000) if ts_val > 1e11 else int(ts_val)
+
+                        processed.append({
+                            "time": ts,
+                            "open": float(c[1]),
+                            "high": float(c[2]),
+                            "low": float(c[3]),
+                            "close": float(c[4]),
+                            "volume": int(c[5]) if len(c) > 5 else 0
+                        })
+                    except (ValueError, IndexError, TypeError):
+                        continue
+
+                if processed:
+                    # Sort and deduplicate
+                    processed.sort(key=lambda x: x["time"])
+                    unique = []
+                    last_ts = None
+                    for c in processed:
+                        if c["time"] != last_ts:
+                            unique.append(c)
+                            last_ts = c["time"]
+                    return {"success": True, "data": unique}
 
             return {"success": False, "error": "No candle data returned"}
 
@@ -508,14 +559,21 @@ class UpstoxClient:
         """Fetch authenticated user profile from Upstox."""
         return await _run_sync(self._get_user_profile_sync)
 
-    def _search_instruments_sync(self, query: str) -> List[Dict[str, Any]]:
+    def _search_instruments_sync(self, query: str, expiry: str = None) -> List[Dict[str, Any]]:
         """Synchronous instrument search using the SDK.
 
         Uses InstrumentsApi.search_instrument() to search by human-readable query.
         Returns a list of SearchResult dicts matching the frontend's expected format.
         """
         try:
-            response = self._instruments_api.search_instrument(query=query)
+            # Handle special expiry parameters like 'current_week', 'current_month'
+            # Note: The SDK might not explicitly have these as named parameters in all versions,
+            # but we can try to pass them if the API supports it.
+            kwargs = {"query": query}
+            if expiry:
+                kwargs["expiry"] = expiry
+
+            response = self._instruments_api.search_instrument(**kwargs)
             if response and hasattr(response, 'data') and response.data:
                 results = []
                 for item in response.data:
@@ -559,7 +617,7 @@ class UpstoxClient:
             print(f"[UpstoxClient] Search error: {e}")
             return []
 
-    async def search_instruments(self, query: str) -> List[Dict[str, Any]]:
+    async def search_instruments(self, query: str, expiry: str = None) -> List[Dict[str, Any]]:
         """Search instruments by human-readable query like 'NIFTY 23900 CE'.
 
         Uses InstrumentsApi.search_instrument() from the official SDK.
@@ -569,12 +627,12 @@ class UpstoxClient:
         if not query or len(query) < 2:
             return []
 
-        cache_key = self._cache_key("GET", "/instruments/search", q=query)
+        cache_key = self._cache_key("GET", "/instruments/search", q=query, expiry=expiry)
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached
 
-        results = await _run_sync(self._search_instruments_sync, query)
+        results = await _run_sync(self._search_instruments_sync, query, expiry)
 
         if results:
             # Cache instrument search for 30 seconds

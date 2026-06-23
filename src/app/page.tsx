@@ -23,11 +23,13 @@ export default function TradingTerminal() {
 
   // Auto-select ATM strike when it changes
   const atmStrike = useTradingStore((s) => s.atmStrike);
+  const selectedStrike = useTradingStore((s) => s.selectedStrike);
+
   useEffect(() => {
-    if (atmStrike) {
+    if (atmStrike && !selectedStrike) {
       setSelectedStrike(atmStrike);
     }
-  }, [atmStrike, setSelectedStrike]);
+  }, [atmStrike, selectedStrike, setSelectedStrike]);
 
   return (
     <div className="flex h-screen flex-col bg-[#0a0e17] overflow-hidden no-select">

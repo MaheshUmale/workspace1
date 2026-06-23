@@ -90,21 +90,61 @@ export function OptionChart({ optionType }: OptionChartProps) {
 
   // Load data — use instrument_key from option chain if available (Bug 5 fix)
   const loadData = useCallback(async () => {
-    if (!candleSeriesRef.current || !volumeSeriesRef.current || !expiry) return;
+    if (!candleSeriesRef.current || !volumeSeriesRef.current || !expiry) {
+      console.log(`[OptionChart] Skipping load: expiry=${expiry}, seriesReady=${!!candleSeriesRef.current}`);
+      return;
+    }
+
     // Don't try to fetch if we don't have a valid strike yet
-    if (!currentStrike || currentStrike === 0) return;
+    if (!currentStrike || currentStrike === 0) {
+      console.log(`[OptionChart] No strike selected yet`);
+      return;
+    }
+
+    console.log(`[OptionChart] Loading ${currentStrike} ${optionType} for ${expiry}`);
 
     // Bug 5: Use instrument key from option chain data instead of buildInstrumentKey
     const chainRow = optionChain.find((r) => r.strike === currentStrike);
-    let instrumentKey: string;
+    let instrumentKey: string | undefined;
     if (optionType === 'CE') {
-      instrumentKey = chainRow?.ce_instrument_key || buildInstrumentKey(underlying, expiry, currentStrike, optionType);
+      instrumentKey = chainRow?.ce_instrument_key;
     } else {
-      instrumentKey = chainRow?.pe_instrument_key || buildInstrumentKey(underlying, expiry, currentStrike, optionType);
+      instrumentKey = chainRow?.pe_instrument_key;
     }
 
-    // Skip if no valid instrument key
-    if (!instrumentKey) return;
+    // If not in chain, try searching for it (more accurate)
+    if (!instrumentKey) {
+      try {
+        const query = `${underlying} ${currentStrike} ${optionType}`;
+        console.log(`[OptionChart] Searching for ${query}`);
+        const searchResults = await fetchAPI<{ results: any[] }>('/api/instruments/search', {
+          q: query,
+          expiry: 'current_week'
+        });
+
+        // Find exact match
+        const match = searchResults.results.find(r =>
+          r.strike === currentStrike &&
+          r.option_type === optionType &&
+          r.expiry === expiry
+        );
+
+        if (match) {
+          instrumentKey = match.instrument_key;
+          console.log(`[OptionChart] Found key via search: ${instrumentKey}`);
+        }
+      } catch (err) {
+        console.error(`[OptionChart] Search failed:`, err);
+      }
+    }
+
+    // If still not found, try building it (last resort)
+    if (!instrumentKey) {
+      instrumentKey = buildInstrumentKey(underlying, expiry, currentStrike, optionType);
+      console.log(`[OptionChart] Falling back to built key: ${instrumentKey}`);
+    }
+
+    console.log(`[OptionChart] Final key: ${instrumentKey}`);
 
     const candles = await fetchCandles(instrumentKey, timeframe);
     if (candles.length === 0) return;

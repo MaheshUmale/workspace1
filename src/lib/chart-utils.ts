@@ -147,8 +147,15 @@ export function buildInstrumentKey(
   strike: number,
   optionType: string
 ): string {
-  const expiryCompact = expiry.replace(/-/g, '').slice(2);
-  return `NSE_FO|${underlying}${expiryCompact}${strike}${optionType}`;
+  // Upstox instrument key format: NSE_FO|NIFTY2462723900CE
+  // expiry: YYYY-MM-DD -> YYM (where M is 1-9, O, N, D for monthly) or YYMDD
+  // However, the simplest format often accepted is SYMBOLYYMMDDSTRIKETYPE
+  const d = new Date(expiry);
+  const yy = d.getFullYear().toString().slice(2);
+  const mm = (d.getMonth() + 1).toString().padStart(2, '0');
+  const dd = d.getDate().toString().padStart(2, '0');
+
+  return `NSE_FO|${underlying}${yy}${mm}${dd}${strike}${optionType}`;
 }
 
 export function parseInstrumentKey(key: string): {
