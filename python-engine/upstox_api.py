@@ -1,22 +1,23 @@
 """
-Upstox API Client — Official Upstox Python SDK integration with V3 fallback for custom timeframes.
-Supports 1m, 3m, 5m, 15m, 30m, 1h, 1d intervals.
+Upstox API Client — Robust V3 implementation with V2 fallback.
+Handles custom timeframes (3m, 5m, 15m, etc.) using Upstox V3 REST API.
+Uses V3 REST as primary for all candle data.
 """
 
 import time
 import json
 import asyncio
 import httpx
+import urllib.parse
 from functools import partial
 from collections import OrderedDict
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 
-# Try to import SDK - but we handle if it's not there
+# Try to import SDK for other methods (Option Chain, Search, etc.)
 try:
     from upstox_client import Configuration, ApiClient
     from upstox_client.api import UserApi, HistoryApi, OptionsApi, InstrumentsApi, MarketQuoteApi
-    from upstox_client.rest import ApiException
     HAS_SDK = True
 except ImportError:
     HAS_SDK = False
@@ -80,51 +81,59 @@ class UpstoxClient:
         return self.access_token[:10] + "****" + self.access_token[-4:]
 
     async def validate_token(self) -> Dict[str, Any]:
-        if not HAS_SDK:
-            return {"valid": True}
+        if not HAS_SDK: return {"valid": True}
         return await _run_sync(self._validate_token_sync)
 
     def _validate_token_sync(self) -> Dict[str, Any]:
         try:
-            profile = self._user_api.get_profile(api_version='2.0')
+            self._user_api.get_profile(api_version='2.0')
             return {"valid": True}
         except Exception as e:
             return {"valid": False, "error": str(e)}
 
+    # ================================================================
+    # Candle Data (V3 REST Primary)
+    # ================================================================
+
     async def get_candles(self, instrument_key: str, timeframe: str) -> Dict[str, Any]:
-        """Fetch candles with smart V2/V3 routing to support custom timeframes."""
+        """Fetch candles using V3 REST API as primary to support custom timeframes."""
         cache_key = self._cache_key("GET", "/candles", key=instrument_key, tf=timeframe)
         cached = self._get_cached(cache_key)
         if cached is not None:
             return {"success": True, "data": cached}
 
-        # V2 SDK only supports 1minute and 30minute.
-        # Everything else (3m, 5m, 15m, 1h) should use V3 API for reliability.
+        # 1. Try V3 REST API (Supports 1m, 3m, 5m, 15m, 30m, 1h, 1d)
+        result = await self._get_candles_v3(instrument_key, timeframe)
+        if result.get("success") and result.get("data"):
+            self._set_cached(cache_key, result["data"])
+            return result
+
+        # 2. Fallback to V2 SDK ONLY for standard intervals if V3 fails
         if timeframe in ("1m", "30m", "1d") and HAS_SDK:
+            print(f"[UpstoxClient] V3 failed for {instrument_key} @ {timeframe}, falling back to V2 SDK")
             result = await _run_sync(self._get_candles_v2_sync, instrument_key, timeframe)
             if result.get("success"):
                 self._set_cached(cache_key, result["data"])
                 return result
 
-        # Use V3 REST API for custom intervals
-        result = await self._get_candles_v3(instrument_key, timeframe)
-        if result.get("success"):
-            self._set_cached(cache_key, result["data"])
-            return result
-
-        return {"success": False, "error": "Failed to fetch candles"}
+        return {"success": False, "error": result.get("error", "Failed to fetch candles")}
 
     async def _get_candles_v3(self, instrument_key: str, timeframe: str) -> Dict[str, Any]:
-        """Fetch custom interval candles using V3 APIs (Historical + Intraday)."""
+        """Fetch candles using V3 REST APIs (Historical + Intraday fallback)."""
+        upstox_key = instrument_key
+        if instrument_key == "NIFTY": upstox_key = "NSE_INDEX|Nifty 50"
+        elif instrument_key == "BANKNIFTY": upstox_key = "NSE_INDEX|Nifty Bank"
+
         if timeframe.endswith('m'):
             unit, interval = "minutes", timeframe[:-1]
         elif timeframe.endswith('h'):
             unit, interval = "hours", timeframe[:-1]
         elif timeframe == "1d":
-            unit, interval = "days", "1"
+            unit, interval = "day", "1"
         else:
             unit, interval = "minutes", "1"
 
+        encoded_key = urllib.parse.quote(upstox_key)
         now = datetime.now()
         today_str = now.strftime("%Y-%m-%d")
         from_date = (now - timedelta(days=4)).strftime("%Y-%m-%d")
@@ -133,33 +142,39 @@ class UpstoxClient:
         all_candles = []
 
         async with httpx.AsyncClient() as client:
-            # 1. Intraday V3 (for current day)
-            intra_url = f"https://api.upstox.com/v3/historical-candle/intraday/{instrument_key}/{unit}/{interval}"
-            # 2. Historical V3 (for history)
-            hist_url = f"https://api.upstox.com/v3/historical-candle/{instrument_key}/{unit}/{interval}/{today_str}/{from_date}"
+            # For V3, it's safer to try both historical and intraday and merge
+            # Historical covers up to previous close, Intraday covers today
+            urls = []
+            if timeframe != "1d":
+                urls.append(f"https://api.upstox.com/v3/historical-candle/intraday/{encoded_key}/{unit}/{interval}")
+            urls.append(f"https://api.upstox.com/v3/historical-candle/{encoded_key}/{unit}/{interval}/{today_str}/{from_date}")
 
             try:
-                responses = await asyncio.gather(
-                    client.get(intra_url, headers=headers, timeout=10.0),
-                    client.get(hist_url, headers=headers, timeout=10.0),
-                    return_exceptions=True
-                )
+                responses = await asyncio.gather(*(client.get(u, headers=headers, timeout=10.0) for u in urls), return_exceptions=True)
                 for res in responses:
                     if isinstance(res, httpx.Response) and res.status_code == 200:
                         data = res.json()
-                        candles = data.get("data", {}).get("candles", [])
-                        all_candles.extend(candles)
+                        if data.get("status") == "success":
+                            candles = data.get("data", {}).get("candles", [])
+                            all_candles.extend(candles)
             except Exception as e:
-                print(f"[UpstoxClient] V3 Error: {e}")
+                print(f"[UpstoxClient] V3 REST Fetch Error: {e}")
 
         if not all_candles:
-            return {"success": False}
+            return {"success": False, "error": "No data from V3"}
 
         processed = []
         for c in all_candles:
             try:
                 dt = datetime.fromisoformat(c[0].replace('Z', '+00:00'))
-                processed.append({"time": int(dt.timestamp()), "open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4]), "volume": int(c[5])})
+                processed.append({
+                    "time": int(dt.timestamp()),
+                    "open": float(c[1]),
+                    "high": float(c[2]),
+                    "low": float(c[3]),
+                    "close": float(c[4]),
+                    "volume": int(c[5])
+                })
             except: continue
 
         processed.sort(key=lambda x: x["time"])
@@ -173,14 +188,16 @@ class UpstoxClient:
         return {"success": True, "data": unique}
 
     def _get_candles_v2_sync(self, instrument_key: str, timeframe: str) -> Dict[str, Any]:
+        """V2 SDK fallback."""
         from config import UPSTOX_TIMEFRAME_MAP
-        from datetime import timedelta
 
         upstox_key = instrument_key
         if instrument_key == "NIFTY": upstox_key = "NSE_INDEX|Nifty 50"
         elif instrument_key == "BANKNIFTY": upstox_key = "NSE_INDEX|Nifty Bank"
 
-        upstox_tf = UPSTOX_TIMEFRAME_MAP.get(timeframe, "1minute")
+        upstox_tf = UPSTOX_TIMEFRAME_MAP.get(timeframe)
+        if not upstox_tf or timeframe not in ("1m", "30m", "1d"):
+            return {"success": False, "error": f"V2 SDK does not support {timeframe}"}
 
         try:
             all_candles = []
@@ -213,8 +230,11 @@ class UpstoxClient:
                     last_ts = c["time"]
             return {"success": True, "data": unique}
         except Exception as e:
-            print(f"[UpstoxClient] V2 Error: {e}")
-        return {"success": False}
+            return {"success": False, "error": str(e)}
+
+    # ================================================================
+    # Other Market Data (V2 SDK)
+    # ================================================================
 
     async def get_option_chain(self, underlying: str, expiry: str) -> Dict[str, Any]:
         if not HAS_SDK: return {"success": False}
