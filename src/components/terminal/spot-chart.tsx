@@ -20,7 +20,6 @@ interface OIDrawParams {
   canvasHeight: number;
 }
 
-// Pre-computed constants for drawing
 const CENTER_DIVIDER_COLOR = 'rgba(107, 114, 128, 0.4)';
 const CE_BAR_COLOR = 'rgba(239, 68, 68, 0.45)';
 const CE_BAR_NEG_COLOR = 'rgba(249, 115, 22, 0.35)';
@@ -40,7 +39,6 @@ function drawOIBars({ ctx, series, optionChain, atmStrike, oiProfile, canvasWidt
   const minStrike = atmStrike - step * 15;
   const maxStrike = atmStrike + step * 15;
 
-  // Pre-filter and map in one pass
   const visibleValues: Array<{
     strike: number;
     ceVal: number;
@@ -67,7 +65,6 @@ function drawOIBars({ ctx, series, optionChain, atmStrike, oiProfile, canvasWidt
   const maxBarPixels = canvasWidth * 0.35;
   const centerX = canvasWidth * 0.55;
 
-  // Draw center divider
   ctx.strokeStyle = CENTER_DIVIDER_COLOR;
   ctx.lineWidth = 1;
   ctx.beginPath();
@@ -75,11 +72,8 @@ function drawOIBars({ ctx, series, optionChain, atmStrike, oiProfile, canvasWidt
   ctx.lineTo(centerX, canvasHeight);
   ctx.stroke();
 
-  // Batch draw bars
   for (const v of visibleValues) {
     const y = v.y!;
-
-    // CE bar
     const ceBarWidth = (v.ceVal / maxVal) * maxBarPixels;
     if (ceBarWidth > 0) {
       const isCeNegative = oiProfile === 'COI' && v.ceChangeOi < 0;
@@ -95,7 +89,6 @@ function drawOIBars({ ctx, series, optionChain, atmStrike, oiProfile, canvasWidt
       }
     }
 
-    // PE bar
     const peBarWidth = (v.peVal / maxVal) * maxBarPixels;
     if (peBarWidth > 0) {
       const isPeNegative = oiProfile === 'COI' && v.peChangeOi < 0;
@@ -111,7 +104,6 @@ function drawOIBars({ ctx, series, optionChain, atmStrike, oiProfile, canvasWidt
       }
     }
 
-    // ATM highlight
     if (v.strike === atmStrike) {
       ctx.strokeStyle = ATM_STROKE_COLOR;
       ctx.lineWidth = 1;
@@ -119,7 +111,6 @@ function drawOIBars({ ctx, series, optionChain, atmStrike, oiProfile, canvasWidt
     }
   }
 
-  // Legend
   ctx.fillStyle = LEGEND_TEXT_COLOR;
   ctx.font = 'bold 10px sans-serif';
   ctx.textAlign = 'left';
@@ -148,7 +139,7 @@ const ChartHeader = memo(function ChartHeader({
   onToggle,
 }: {
   underlying: string;
-  spot: ReturnType<typeof useTradingStore.getState>['spotData'][string] | undefined;
+  spot: any;
   oiProfile: OIProfile;
   onToggle: (p: OIProfile) => void;
 }) {
@@ -203,18 +194,18 @@ export function SpotChart() {
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
-  const priceLineRef = useRef<ReturnType<ISeriesApi<'Candlestick'>['createPriceLine']> | null>(null);
+  const priceLineRef = useRef<any>(null);
   const rafRef = useRef<number>(0);
-  const redrawIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const redrawIntervalRef = useRef<any>(null);
   const lastDrawRef = useRef<string>('');
   const lastUnderlyingRef = useRef<string>('');
+  const lastTimeframeRef = useRef<string>('');
   const [isAutoFit, setIsAutoFit] = useState(true);
 
   const { underlying, spotData, timeframe, atmStrike, optionChain, oiProfile, setOiProfile } = useTradingStore();
   const spot = spotData[underlying];
   const { fetchCandles } = useMarketData();
 
-  // Redraw OI bars overlay - throttled and deduplicated
   const redrawOI = useCallback(() => {
     if (!chartRef.current || !candleSeriesRef.current || !overlayCanvasRef.current) return;
     const canvas = overlayCanvasRef.current;
@@ -236,8 +227,9 @@ export function SpotChart() {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
-    // Deduplicate: skip if data hash hasn't changed
-    const dataHash = `${optionChain.length}-${atmStrike}-${oiProfile}-${rect.width}-${rect.height}`;
+    const logicalRange = chartRef.current.timeScale().getVisibleLogicalRange();
+    const rangeHash = logicalRange ? `${logicalRange.from}-${logicalRange.to}` : '';
+    const dataHash = `${optionChain.length}-${atmStrike}-${oiProfile}-${rect.width}-${rect.height}-${rangeHash}`;
     if (dataHash === lastDrawRef.current) return;
     lastDrawRef.current = dataHash;
 
@@ -252,7 +244,6 @@ export function SpotChart() {
     });
   }, [optionChain, atmStrike, oiProfile]);
 
-  // Initialize chart
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -287,33 +278,33 @@ export function SpotChart() {
     candleSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
 
-    // Throttled redraw: 5fps instead of 10fps, with deduplication
     redrawIntervalRef.current = setInterval(() => {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = requestAnimationFrame(redrawOI);
-    }, 200);
+    }, 100);
 
     return () => {
-      if (redrawIntervalRef.current) {
-        clearInterval(redrawIntervalRef.current);
-        redrawIntervalRef.current = null;
-      }
+      if (redrawIntervalRef.current) clearInterval(redrawIntervalRef.current);
       resizeObserver.disconnect();
       cancelAnimationFrame(rafRef.current);
-      chart.timeScale().unsubscribeVisibleLogicalRangeChange(() => {});
       chart.remove();
       chartRef.current = null;
     };
   }, []);
 
-  // Load historical data
   const loadCandles = useCallback(async () => {
     if (!candleSeriesRef.current || !volumeSeriesRef.current) return;
 
+    console.log(`[SpotChart] Loading candles for ${underlying} @ ${timeframe}`);
     const candles = await fetchCandles(underlying, timeframe);
-    if (candles.length === 0) return;
+    if (!candles || candles.length === 0) {
+      console.log(`[SpotChart] No candles returned for ${underlying} @ ${timeframe}`);
+      candleSeriesRef.current.setData([]);
+      volumeSeriesRef.current.setData([]);
+      return;
+    }
 
-    const sorted = candles.sort((a, b) => a.time - b.time);
+    const sorted = [...candles].sort((a, b) => a.time - b.time);
 
     candleSeriesRef.current.setData(
       sorted.map((c) => ({
@@ -334,12 +325,14 @@ export function SpotChart() {
     );
 
     const isNewUnderlying = underlying !== lastUnderlyingRef.current;
-    if (isAutoFit || isNewUnderlying) {
+    const isNewTimeframe = timeframe !== lastTimeframeRef.current;
+    if (isAutoFit || isNewUnderlying || isNewTimeframe) {
+      console.log(`[SpotChart] Fitting content (isAutoFit=${isAutoFit}, isNewUnderlying=${isNewUnderlying}, isNewTimeframe=${isNewTimeframe})`);
       chartRef.current?.timeScale().fitContent();
       lastUnderlyingRef.current = underlying;
+      lastTimeframeRef.current = timeframe;
     }
 
-    // Single delayed redraw after fitContent
     setTimeout(() => {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = requestAnimationFrame(redrawOI);
@@ -350,19 +343,17 @@ export function SpotChart() {
     loadCandles();
   }, [loadCandles]);
 
-  // Redraw OI bars when data/profile changes
   useEffect(() => {
-    lastDrawRef.current = ''; // Force redraw
-    cancelAnimationFrame(rafRef.current);
-    rafRef.current = requestAnimationFrame(redrawOI);
-  }, [redrawOI]);
+    lastDrawRef.current = '';
+    const raf = requestAnimationFrame(redrawOI);
+    return () => cancelAnimationFrame(raf);
+  }, [redrawOI, optionChain, atmStrike, oiProfile]);
 
-  // Update price line on spot change
   useEffect(() => {
     if (!candleSeriesRef.current || !spot) return;
 
     if (priceLineRef.current) {
-      try { candleSeriesRef.current.removePriceLine(priceLineRef.current); } catch { /* ignore */ }
+      try { candleSeriesRef.current.removePriceLine(priceLineRef.current); } catch { }
     }
 
     priceLineRef.current = candleSeriesRef.current.createPriceLine({
@@ -374,50 +365,20 @@ export function SpotChart() {
       title: '',
     });
 
-    const lastTime = Math.floor(Date.now() / 1000);
+    const tfSeconds = timeframe === '1h' ? 3600 : parseInt(timeframe) * 60;
+    const now = Math.floor(Date.now() / 1000);
+    const alignedTime = Math.floor(now / tfSeconds) * tfSeconds;
+
     try {
       candleSeriesRef.current.update({
-        time: lastTime as any,
+        time: alignedTime as any,
         open: spot.ltp - (spot.change > 0 ? 5 : -5),
         high: spot.high,
         low: spot.low,
         close: spot.ltp,
       });
-    } catch { /* ignore sequential update errors */ }
-  }, [spot?.ltp, spot?.high, spot?.low, spot?.change]);
-
-  // Create overlay canvas element
-  useEffect(() => {
-    if (!containerRef.current) return;
-
-    const existingCanvas = containerRef.current.querySelector('.oi-overlay-canvas');
-    if (existingCanvas) {
-      overlayCanvasRef.current = existingCanvas as HTMLCanvasElement;
-      return;
-    }
-
-    const canvas = document.createElement('canvas');
-    canvas.className = 'oi-overlay-canvas';
-    canvas.style.position = 'absolute';
-    canvas.style.top = '0';
-    canvas.style.left = '0';
-    canvas.style.width = '100%';
-    canvas.style.height = '100%';
-    canvas.style.pointerEvents = 'none';
-    canvas.style.zIndex = '10';
-
-    containerRef.current.style.position = 'relative';
-    containerRef.current.appendChild(canvas);
-    overlayCanvasRef.current = canvas;
-
-    cancelAnimationFrame(rafRef.current);
-    rafRef.current = requestAnimationFrame(redrawOI);
-
-    return () => {
-      canvas.remove();
-      overlayCanvasRef.current = null;
-    };
-  }, []);
+    } catch { }
+  }, [spot?.ltp, spot?.high, spot?.low, spot?.change, timeframe]);
 
   return (
     <div className="flex flex-col h-full">
@@ -427,21 +388,25 @@ export function SpotChart() {
         oiProfile={oiProfile}
         onToggle={setOiProfile}
       />
-      <div className="flex-1 min-h-0 relative group">
+      <div className="flex-1 min-h-0 relative">
         <div ref={containerRef} className="w-full h-full" />
 
-        {/* Chart Controls */}
-        <div className="absolute bottom-4 right-4 flex items-center gap-1.5 z-20 opacity-0 group-hover:opacity-100 transition-opacity">
+        <canvas
+          ref={overlayCanvasRef}
+          className="absolute inset-0 w-full h-full pointer-events-none z-10"
+        />
+
+        <div className="absolute bottom-4 left-4 flex items-center gap-1 z-20">
           <button
             onClick={() => chartRef.current?.timeScale().zoomIn(0.1)}
-            className="p-1.5 bg-[#1f2937]/80 hover:bg-[#374151] rounded text-gray-400 hover:text-white border border-[#374151] transition-colors"
+            className="p-1 bg-[#1f2937]/90 hover:bg-[#374151] rounded text-gray-400 hover:text-white border border-[#374151] transition-colors shadow-lg"
             title="Zoom In"
           >
             <Plus size={14} />
           </button>
           <button
             onClick={() => chartRef.current?.timeScale().zoomOut(0.1)}
-            className="p-1.5 bg-[#1f2937]/80 hover:bg-[#374151] rounded text-gray-400 hover:text-white border border-[#374151] transition-colors"
+            className="p-1 bg-[#1f2937]/90 hover:bg-[#374151] rounded text-gray-400 hover:text-white border border-[#374151] transition-colors shadow-lg"
             title="Zoom Out"
           >
             <Minus size={14} />
@@ -453,13 +418,13 @@ export function SpotChart() {
                 chartRef.current?.timeScale().fitContent();
               }
             }}
-            className={`flex items-center gap-1 px-2 py-1.5 rounded text-[10px] font-bold border transition-colors ${
+            className={`flex items-center gap-1 px-2 py-1 rounded text-[9px] font-bold border transition-all shadow-lg ${
               isAutoFit
-                ? 'bg-blue-600/80 border-blue-500 text-white'
-                : 'bg-[#1f2937]/80 border-[#374151] text-gray-400 hover:text-white'
+                ? 'bg-blue-600 border-blue-500 text-white'
+                : 'bg-[#1f2937]/90 border-[#374151] text-gray-400 hover:text-white'
             }`}
           >
-            <Maximize2 size={12} />
+            <Maximize2 size={10} />
             AUTO
           </button>
         </div>

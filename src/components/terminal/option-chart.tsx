@@ -18,20 +18,17 @@ export function OptionChart({ optionType }: OptionChartProps) {
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const lastKeyRef = useRef<string>('');
+  const lastTimeframeRef = useRef<string>('');
   const [isAutoFit, setIsAutoFit] = useState(true);
 
   const { underlying, expiry, selectedStrike, timeframe, optionChain, spotData, atmStrike } = useTradingStore();
   const spot = spotData[underlying];
   const { fetchCandles } = useMarketData();
 
-  // Bug 5 fix: Use selectedStrike (which is set to ATM by the main page)
-  // Fall back to closest strike in option chain if exact match not found
   const currentStrike = (() => {
     if (selectedStrike > 0) {
-      // Check if selectedStrike exists in chain
       const exactMatch = optionChain.find(r => r.strike === selectedStrike);
       if (exactMatch) return selectedStrike;
-      // Find closest strike
       if (optionChain.length > 0) {
         const closest = optionChain.reduce((prev, curr) =>
           Math.abs(curr.strike - selectedStrike) < Math.abs(prev.strike - selectedStrike) ? curr : prev
@@ -39,16 +36,13 @@ export function OptionChart({ optionType }: OptionChartProps) {
         return closest.strike;
       }
     }
-    // Fallback: use ATM strike from store
     if (atmStrike > 0) return atmStrike;
-    // Last resort: middle of chain
     if (optionChain.length > 0) {
       return optionChain[Math.floor(optionChain.length / 2)]?.strike ?? 0;
     }
     return 0;
   })();
 
-  // Initialize chart
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -58,20 +52,14 @@ export function OptionChart({ optionType }: OptionChartProps) {
       height: containerRef.current.clientHeight,
     });
 
-    const candleSeries = addCandlestickSeries(chart, {
-      ...CANDLE_COLORS,
-    });
-
+    const candleSeries = addCandlestickSeries(chart, { ...CANDLE_COLORS });
     const volumeSeries = addHistogramSeries(chart, {
       priceFormat: { type: 'volume' },
       priceScaleId: 'volume',
     });
 
-    chart.priceScale('volume').applyOptions({
-      scaleMargins: { top: 0.85, bottom: 0 },
-    });
+    chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
 
-    // Handle resize
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const { width, height } = entry.contentRect;
@@ -91,66 +79,40 @@ export function OptionChart({ optionType }: OptionChartProps) {
     };
   }, [optionType]);
 
-  // Load data — use instrument_key from option chain if available (Bug 5 fix)
   const loadData = useCallback(async () => {
-    if (!candleSeriesRef.current || !volumeSeriesRef.current || !expiry) {
-      console.log(`[OptionChart] Skipping load: expiry=${expiry}, seriesReady=${!!candleSeriesRef.current}`);
-      return;
-    }
+    if (!candleSeriesRef.current || !volumeSeriesRef.current || !expiry) return;
+    if (!currentStrike || currentStrike === 0) return;
 
-    // Don't try to fetch if we don't have a valid strike yet
-    if (!currentStrike || currentStrike === 0) {
-      console.log(`[OptionChart] No strike selected yet`);
-      return;
-    }
+    console.log(`[OptionChart] Loading ${currentStrike} ${optionType} for ${expiry} @ ${timeframe}`);
 
-    console.log(`[OptionChart] Loading ${currentStrike} ${optionType} for ${expiry}`);
-
-    // Bug 5: Use instrument key from option chain data instead of buildInstrumentKey
     const chainRow = optionChain.find((r) => r.strike === currentStrike);
-    let instrumentKey: string | undefined;
-    if (optionType === 'CE') {
-      instrumentKey = chainRow?.ce_instrument_key;
-    } else {
-      instrumentKey = chainRow?.pe_instrument_key;
-    }
+    let instrumentKey = optionType === 'CE' ? chainRow?.ce_instrument_key : chainRow?.pe_instrument_key;
 
-    // If not in chain, try searching for it (more accurate)
     if (!instrumentKey) {
       try {
         const query = `${underlying} ${currentStrike} ${optionType}`;
-        console.log(`[OptionChart] Searching for ${query}`);
         const searchResults = await fetchAPI<{ results: any[] }>('/api/instruments/search', {
           q: query,
           expiry: 'current_week'
         });
-
-        // Find exact match
         const match = searchResults.results.find(r =>
-          r.strike === currentStrike &&
-          r.option_type === optionType &&
-          r.expiry === expiry
+          r.strike === currentStrike && r.option_type === optionType && r.expiry === expiry
         );
-
-        if (match) {
-          instrumentKey = match.instrument_key;
-          console.log(`[OptionChart] Found key via search: ${instrumentKey}`);
-        }
-      } catch (err) {
-        console.error(`[OptionChart] Search failed:`, err);
-      }
+        if (match) instrumentKey = match.instrument_key;
+      } catch (err) { }
     }
 
-    // If still not found, try building it (last resort)
     if (!instrumentKey) {
       instrumentKey = buildInstrumentKey(underlying, expiry, currentStrike, optionType);
-      console.log(`[OptionChart] Falling back to built key: ${instrumentKey}`);
     }
 
-    console.log(`[OptionChart] Final key: ${instrumentKey}`);
-
     const candles = await fetchCandles(instrumentKey, timeframe);
-    if (candles.length === 0) return;
+    if (!candles || candles.length === 0) {
+      console.log(`[OptionChart] No candles returned for ${instrumentKey} @ ${timeframe}`);
+      candleSeriesRef.current.setData([]);
+      volumeSeriesRef.current.setData([]);
+      return;
+    }
 
     const sorted = [...candles].sort((a, b) => a.time - b.time);
 
@@ -172,13 +134,13 @@ export function OptionChart({ optionType }: OptionChartProps) {
       }))
     );
 
-    // Bug 3 fix: REMOVED fake sine wave OI line series data generation.
-    // Option charts should ONLY show candlesticks + volume.
-
     const isNewInstrument = instrumentKey !== lastKeyRef.current;
-    if (isAutoFit || isNewInstrument) {
+    const isNewTimeframe = timeframe !== lastTimeframeRef.current;
+    if (isAutoFit || isNewInstrument || isNewTimeframe) {
+      console.log(`[OptionChart] Fitting content (isAutoFit=${isAutoFit}, isNewInstrument=${isNewInstrument}, isNewTimeframe=${isNewTimeframe})`);
       chartRef.current?.timeScale().fitContent();
       lastKeyRef.current = instrumentKey;
+      lastTimeframeRef.current = timeframe;
     }
   }, [underlying, expiry, currentStrike, optionType, timeframe, fetchCandles, optionChain, isAutoFit]);
 
@@ -186,17 +148,14 @@ export function OptionChart({ optionType }: OptionChartProps) {
     loadData();
   }, [loadData]);
 
-  // Get LTP from option chain
   const chainRow = optionChain.find((r) => r.strike === currentStrike);
   const ltp = optionType === 'CE' ? chainRow?.ce_ltp : chainRow?.pe_ltp;
   const oi = optionType === 'CE' ? chainRow?.ce_oi : chainRow?.pe_oi;
   const changeOi = optionType === 'CE' ? chainRow?.ce_change_oi : chainRow?.pe_change_oi;
-
   const accentColor = optionType === 'CE' ? 'text-green-400' : 'text-red-400';
 
   return (
     <div className="flex flex-col h-full">
-      {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-[#1f2937] shrink-0">
         <div className="flex items-center gap-3">
           <span className={`text-xs font-semibold uppercase tracking-wide ${accentColor}`}>
@@ -217,22 +176,20 @@ export function OptionChart({ optionType }: OptionChartProps) {
         <TimeframeSelector compact />
       </div>
 
-      {/* Chart */}
-      <div className="flex-1 min-h-0 relative group">
+      <div className="flex-1 min-h-0 relative">
         <div ref={containerRef} className="w-full h-full" />
 
-        {/* Chart Controls */}
-        <div className="absolute bottom-4 right-4 flex items-center gap-1.5 z-20 opacity-0 group-hover:opacity-100 transition-opacity">
+        <div className="absolute bottom-4 left-4 flex items-center gap-1 z-20">
           <button
             onClick={() => chartRef.current?.timeScale().zoomIn(0.1)}
-            className="p-1.5 bg-[#1f2937]/80 hover:bg-[#374151] rounded text-gray-400 hover:text-white border border-[#374151] transition-colors"
+            className="p-1 bg-[#1f2937]/90 hover:bg-[#374151] rounded text-gray-400 hover:text-white border border-[#374151] transition-colors shadow-lg"
             title="Zoom In"
           >
             <Plus size={14} />
           </button>
           <button
             onClick={() => chartRef.current?.timeScale().zoomOut(0.1)}
-            className="p-1.5 bg-[#1f2937]/80 hover:bg-[#374151] rounded text-gray-400 hover:text-white border border-[#374151] transition-colors"
+            className="p-1 bg-[#1f2937]/90 hover:bg-[#374151] rounded text-gray-400 hover:text-white border border-[#374151] transition-colors shadow-lg"
             title="Zoom Out"
           >
             <Minus size={14} />
@@ -244,13 +201,13 @@ export function OptionChart({ optionType }: OptionChartProps) {
                 chartRef.current?.timeScale().fitContent();
               }
             }}
-            className={`flex items-center gap-1 px-2 py-1.5 rounded text-[10px] font-bold border transition-colors ${
+            className={`flex items-center gap-1 px-2 py-1 rounded text-[9px] font-bold border transition-all shadow-lg ${
               isAutoFit
-                ? 'bg-blue-600/80 border-blue-500 text-white'
-                : 'bg-[#1f2937]/80 border-[#374151] text-gray-400 hover:text-white'
+                ? 'bg-blue-600 border-blue-500 text-white'
+                : 'bg-[#1f2937]/90 border-[#374151] text-gray-400 hover:text-white'
             }`}
           >
-            <Maximize2 size={12} />
+            <Maximize2 size={10} />
             AUTO
           </button>
         </div>

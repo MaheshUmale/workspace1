@@ -21,7 +21,11 @@ export function TimeframeSelector({ value, onChange, compact = false }: Timefram
   const storeSetTimeframe = useTradingStore((s) => s.setTimeframe);
 
   const currentTf = value || storeTimeframe;
-  const handleChange = onChange || storeSetTimeframe;
+  const handleChange = (tf: Timeframe) => {
+    console.log(`[TimeframeSelector] Changing to ${tf}`);
+    if (onChange) onChange(tf);
+    else storeSetTimeframe(tf);
+  };
 
   return (
     <div className="flex items-center gap-0.5 rounded-md bg-[#111827] p-0.5">
