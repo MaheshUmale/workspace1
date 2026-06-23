@@ -552,9 +552,9 @@ export default function SevenStrikePage() {
           <div className="flex items-center gap-3">
             {/* Mode indicator */}
             <div className="hidden md:flex items-center gap-1.5">
-              <div className={`h-1.5 w-1.5 rounded-full ${isLive ? 'bg-green-500 animate-pulse' : 'bg-yellow-500'}`} />
+              <div className={`h-1.5 w-1.5 rounded-full ${isLive ? 'bg-green-500 animate-pulse' : 'bg-gray-500'}`} />
               <span className="text-[10px] font-medium text-gray-400">
-                {isLive ? 'LIVE' : 'SIMULATED'}
+                {isLive ? 'LIVE' : 'OFFLINE'}
               </span>
             </div>
 
