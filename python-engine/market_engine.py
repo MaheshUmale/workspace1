@@ -384,22 +384,8 @@ class MarketEngine:
         if self.mode == "live" and self.upstox:
             result = await self.upstox.get_candles(instrument_key, timeframe)
             if result.get("success") and result.get("data"):
-                candles = []
-                for c in result["data"]:
-                    try:
-                        ts = c[0] if isinstance(c[0], (int, float)) else int(c[0])
-                        candles.append({
-                            "time": int(ts) if ts > 1e12 else int(ts),
-                            "open": float(c[1]),
-                            "high": float(c[2]),
-                            "low": float(c[3]),
-                            "close": float(c[4]),
-                            "volume": int(c[5]) if len(c) > 5 else 0,
-                        })
-                    except (IndexError, ValueError, TypeError):
-                        continue
-                if candles:
-                    return candles
+                # Data is already processed by UpstoxClient._get_candles_sync
+                return result["data"]
         # 2. Try DB data
         db_candles = self._db.get_candles(instrument_key, timeframe)
         if db_candles:
@@ -694,10 +680,10 @@ class MarketEngine:
         # The route should use search_instruments_async instead
         return []
 
-    async def search_instruments_async(self, query: str) -> list:
+    async def search_instruments_async(self, query: str, expiry: str = None) -> list:
         """Search instruments — LIVE Upstox SDK → empty list."""
         if self.mode == "live" and self.upstox:
-            results = await self.upstox.search_instruments(query)
+            results = await self.upstox.search_instruments(query, expiry)
             if results:
                 return results
         return []
