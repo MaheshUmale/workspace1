@@ -79,3 +79,6 @@ wheels/
 
 # Junk
 3000
+python-engine/python-engine/data/trading.duckdb
+python-engine/python-engine/data/trading.duckdb.wal
+start.ps1
