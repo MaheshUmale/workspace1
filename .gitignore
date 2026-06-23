@@ -77,6 +77,8 @@ wheels/
 .installed.cfg
 *.egg
 
+python-engine/python-engine/data/trading.duckdb
+python-engine/python-engine/data/trading.duckdb.wal
 # Junk
 3000
 python-engine/python-engine/data/trading.duckdb
