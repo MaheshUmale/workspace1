@@ -46,7 +46,7 @@ Trading terminal UI components organized into two directories: `terminal/` (doma
 - 48px height (`h-12`)
 
 ### terminal/connection-status.tsx
-- Shows LIVE/OFFLINE/SIM badge based on Python engine health
+- Shows LIVE/OFFLINE badge based on Python engine health
 
 ### terminal/upstox-config-dialog.tsx
 - Dialog for entering/updating Upstox access token
